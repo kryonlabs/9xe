@@ -5,7 +5,7 @@ import (
 	"log"
 	"os"
 
-	"github.com/KryonLabs/9xe/internal/aout"
+	"github.com/kryonlabs/9xe/lib/aout"
 )
 
 func main() {

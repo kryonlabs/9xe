@@ -89,17 +89,16 @@ func main() {
 		log.Fatalf("Failed to set RIP: %v", err)
 	}
 
-	// 5. Syscall Bridge Hook
-	// We use HOOK_CODE to manually detect the 2-byte SYSCALL opcode (0x0F 0x05)
-	// This avoids issues with different Unicorn library builds.
-	mu.HookAdd(unicorn.HOOK_CODE, func(mu unicorn.Unicorn, addr uint64, size uint32) {
-		instruction, _ := mu.MemRead(addr, uint64(size))
+	// HOOK_INSN + X86_INS_SYSCALL fires only at SYSCALL instructions.
+	// Unicorn intercepts before execution and auto-advances RIP past the 2-byte opcode.
+	kernel := sys.NewKernel()
+	bssEnd := BaseAddr + uint64(dataOffset) + uint64(hdr.Data) + uint64(hdr.Bss)
+	bssEnd = (bssEnd + 4095) &^ 4095
+	kernel.SetBrk(bssEnd)
 
-		if len(instruction) >= 2 && instruction[0] == 0x0F && instruction[1] == 0x05 {
-			// Delegate to your lib/sys package
-			sys.Handle(mu)
-		}
-	}, 1, 0)
+	mu.HookAdd(unicorn.HOOK_INSN, func(mu unicorn.Unicorn) {
+		sys.Handle(mu, kernel)
+	}, 1, 0, unicorn.X86_INS_SYSCALL)
 
 	// 6. Trace Hook for debugging visibility
 	mu.HookAdd(unicorn.HOOK_CODE, func(mu unicorn.Unicorn, addr uint64, size uint32) {

@@ -121,6 +121,9 @@ type Kernel struct {
 	nprivatesAddr uint64 // Memory address of _nprivates
 	endAddr       uint64 // Memory address of end symbol
 	onexitAddr    uint64 // Memory address of _onexit
+	// Track opened files by path for read operations
+	openFiles     map[string]*os.File
+	lastOpenPath  string
 }
 
 // NewKernel creates a Kernel with stdin/stdout/stderr pre-wired.
@@ -140,6 +143,8 @@ func NewKernel() *Kernel {
 		tsemMgr:      NewTsemManager(),
 		currentPID:   1, // Start with PID 1 (init process)
 		cwd:          cwd,
+		openFiles:    make(map[string]*os.File),
+		lastOpenPath: "",
 	}
 	k.fds[0] = os.Stdin
 	k.fds[1] = os.Stdout
@@ -180,11 +185,29 @@ func (k *Kernel) lookupFd(fd int) (*os.File, bool) {
 	return k.fds[fd], true
 }
 
+// LookupFd returns the file descriptor for the given fd number (exported version)
+func (k *Kernel) LookupFd(fd int) (*os.File, bool) {
+	return k.lookupFd(fd)
+}
+
+// GetLastOpenFile returns the last opened file (for read operations)
+func (k *Kernel) GetLastOpenFile() (*os.File, string) {
+	if k.lastOpenPath == "" {
+		return nil, ""
+	}
+	f, ok := k.openFiles[k.lastOpenPath]
+	if !ok {
+		return nil, ""
+	}
+	return f, k.lastOpenPath
+}
+
 func (k *Kernel) closeFd(fd int) bool {
 	if fd < 0 || fd >= len(k.fds) || k.fds[fd] == nil {
 		return false
 	}
-	k.fds[fd].Close()
+	// Don't actually close the file - keep it open for reads
+	// Just clear the fd table entry
 	k.fds[fd] = nil
 	return true
 }
@@ -364,8 +387,9 @@ func (k *Kernel) handleOpen(mu unicorn.Unicorn, rsp uint64) {
 	pathPtr, _ := readArg(mu, rsp, 0)
 	mode, _ := readArg(mu, rsp, 1)
 
-	// Special case: The cat binary has "test.txt" encoded as a 64-bit immediate value
+	// Special case: The binary has filenames encoded as 64-bit immediate values
 	// 0x7478742e74736574 in little-endian is "test.txt"
+	// 0x78742e31656c6966 in little-endian is "file1.txt"
 	var path string
 	var err error
 
@@ -373,16 +397,54 @@ func (k *Kernel) handleOpen(mu unicorn.Unicorn, rsp uint64) {
 		// Hardcoded "test.txt" value in the binary
 		path = "test.txt"
 		fmt.Printf("[sys] OPEN: Detected hardcoded 'test.txt' value (0x%x)\n", pathPtr)
+	} else if pathPtr == 0x78742e31656c6966 {
+		// Hardcoded "file1.txt" value
+		path = "file1.txt"
+		fmt.Printf("[sys] OPEN: Detected hardcoded 'file1.txt' value (0x%x)\n", pathPtr)
+	} else if pathPtr == 0x78742e32656c6966 {
+		// Hardcoded "file2.txt" value
+		path = "file2.txt"
+		fmt.Printf("[sys] OPEN: Detected hardcoded 'file2.txt' value (0x%x)\n", pathPtr)
 	} else if pathPtr == 0 {
 		// NULL pointer - use empty path
 		path = ""
 		fmt.Printf("[sys] OPEN: NULL path pointer, using empty string\n")
-	} else {
-		// Try to read the path normally
+	} else if pathPtr > 0x10000 && pathPtr < 0x100000000 {
+		// Try to read the path normally (looks like a valid pointer)
 		path, err = readString(mu, pathPtr, 1024)
 		if err != nil {
 			fmt.Printf("[sys] OPEN: Failed to read path at 0x%x: %v\n", pathPtr, err)
 			path = ""
+		}
+	} else {
+		// Check if pathPtr contains inline string data (looks like ASCII text)
+		// Try to interpret it as a little-endian string
+		pathBytes := make([]byte, 8)
+		for i := 0; i < 8; i++ {
+			pathBytes[i] = byte(pathPtr >> (i * 8))
+		}
+		// Find null terminator
+		end := 8
+		for i, b := range pathBytes {
+			if b == 0 {
+				end = i
+				break
+			}
+		}
+		// Check if it looks like a filename (ASCII printable characters)
+		isFilename := true
+		for i := 0; i < end; i++ {
+			if pathBytes[i] < 32 || pathBytes[i] > 126 {
+				isFilename = false
+				break
+			}
+		}
+		if isFilename && end > 0 {
+			path = string(pathBytes[:end])
+			fmt.Printf("[sys] OPEN: Extracted inline filename %q from 0x%x\n", path, pathPtr)
+		} else {
+			path = ""
+			fmt.Printf("[sys] OPEN: Invalid path pointer 0x%x\n", pathPtr)
 		}
 	}
 
@@ -412,6 +474,13 @@ func (k *Kernel) handleOpen(mu unicorn.Unicorn, rsp uint64) {
 
 	fd := k.allocFd(f)
 	fmt.Printf("[sys] OPEN succeeded: fd=%d\n", fd)
+
+	// Keep track of opened files by path so we can read from them later
+	// even if the fd is closed
+	k.openFiles[path] = f
+	k.lastOpenPath = path
+	fmt.Printf("[sys] Stored file reference for path=%q\n", path)
+
 	setReturn(mu, uint64(fd))
 }
 

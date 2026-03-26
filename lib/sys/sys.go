@@ -97,6 +97,22 @@ type Tos struct {
 	Clock     uint64 // 64 - user-profiling clock (milliseconds)
 }
 
+// Tm matches Plan 9 time structure (from libc.h)
+// Plan 9 uses 32-bit ints, not 64-bit!
+type Tm struct {
+	Nsec  int32    // nanoseconds (0...1e9)
+	Sec   int32    // seconds (0..60)
+	Min   int32    // minutes (0..59)
+	Hour  int32    // hours (0..23)
+	Mday  int32    // day of month (1..31)
+	Mon   int32    // month (0..11)
+	Year  int32    // year A.D.
+	Wday  int32    // day of week (0..6, Sunday = 0)
+	Yday  int32    // day of year (0..365)
+	Zone  [16]byte // timezone name
+	Tzoff int32    // timezone offset from GMT
+}
+
 // Global variables expected by Plan 9 binaries
 var (
 	_privates  unsafe.Pointer // Pointer to privates array
@@ -651,6 +667,74 @@ func (k *Kernel) SetEndAddress(addr uint64) {
 // SetOnexitAddress sets the memory address of the _onexit function pointer
 func (k *Kernel) SetOnexitAddress(addr uint64) {
 	k.onexitAddr = addr
+}
+
+// InitTimeStructures initializes the Plan 9 time structure at the fixed memory location
+// This is required by programs like 'date' that read time from memory
+func (k *Kernel) InitTimeStructures(mu unicorn.Unicorn, dataAddr uint64) error {
+	now := time.Now()
+
+	// Calculate day of year
+	startOfYear := time.Date(now.Year(), 1, 1, 0, 0, 0, 0, now.Location())
+	yday := int32(now.Sub(startOfYear).Seconds() / 86400)
+
+	// Get timezone offset
+	_, offset := now.Zone()
+
+	tm := Tm{
+		Nsec:  int32(now.UnixNano() % 1e9),
+		Sec:   int32(now.Second()),
+		Min:   int32(now.Minute()),
+		Hour:  int32(now.Hour()),
+		Mday:  int32(now.Day()),
+		Mon:   int32(now.Month() - 1),
+		Year:  int32(now.Year()),
+		Wday:  int32(now.Weekday()),
+		Yday:  yday,
+		Tzoff: int32(offset),
+	}
+
+	// Set timezone name
+	tzName := now.Location().String()
+	if len(tzName) > 15 {
+		tzName = tzName[:15]
+	}
+	copy(tm.Zone[:], tzName)
+	tm.Zone[len(tzName)] = 0 // Null-terminate
+
+	// Write to memory at fixed time data location
+	timeDataAddr := dataAddr + 0x5a50 // 0x405a50
+	err := k.WriteTmToMemory(mu, timeDataAddr, tm)
+	if err == nil {
+		fmt.Printf("[TIME] Initialized time structure at 0x%x: %04d-%02d-%02d %02d:%02d:%02d %s\n",
+			timeDataAddr, tm.Year, tm.Mon+1, tm.Mday, tm.Hour, tm.Min, tm.Sec, string(tm.Zone[:]))
+	}
+	return err
+}
+
+// WriteTmToMemory writes a Plan 9 Tm structure to emulated memory
+// The structure uses 32-bit ints with no padding between fields
+func (k *Kernel) WriteTmToMemory(mu unicorn.Unicorn, addr uint64, tm Tm) error {
+	// Calculate structure size: 9 int32 fields (4 bytes each) + 16 char zone + 1 int32 tzoff + 1 pointer tz
+	// Total: 9*4 + 16 + 4 + 8 = 64 bytes
+	data := make([]byte, 64)
+
+	// Write each field (little-endian for Plan 9 AMD64)
+	binary.LittleEndian.PutUint32(data[0:4], uint32(tm.Nsec))
+	binary.LittleEndian.PutUint32(data[4:8], uint32(tm.Sec))
+	binary.LittleEndian.PutUint32(data[8:12], uint32(tm.Min))
+	binary.LittleEndian.PutUint32(data[12:16], uint32(tm.Hour))
+	binary.LittleEndian.PutUint32(data[16:20], uint32(tm.Mday))
+	binary.LittleEndian.PutUint32(data[20:24], uint32(tm.Mon))
+	binary.LittleEndian.PutUint32(data[24:28], uint32(tm.Year))
+	binary.LittleEndian.PutUint32(data[28:32], uint32(tm.Wday))
+	binary.LittleEndian.PutUint32(data[32:36], uint32(tm.Yday))
+	copy(data[36:52], tm.Zone[:])
+	binary.LittleEndian.PutUint32(data[52:56], uint32(tm.Tzoff))
+	// Tzone *tz pointer - set to NULL (0) for now
+	binary.LittleEndian.PutUint64(data[56:64], 0)
+
+	return mu.MemWrite(addr, data)
 }
 
 // allocVFile allocates a file descriptor for a virtual file (pipe, etc.)

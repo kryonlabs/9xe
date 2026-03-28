@@ -2,6 +2,7 @@ package sys
 
 import (
 	"encoding/binary"
+	"fmt"
 	"io"
 	"os"
 
@@ -50,6 +51,24 @@ func (k *Kernel) handleExec(mu unicorn.Unicorn, rsp uint64) {
 		return
 	}
 
+	// Read symbol table to find main() function
+	var mainAddr uint64 = uint64(hdr.Entry) // Default to entry point
+	if hdr.Syms > 0 {
+		symTableOffset := int64(32 + hdr.Text + hdr.Data)
+		if _, err := f.Seek(symTableOffset, 0); err == nil {
+			symbols, err := aout.ReadSymbolTable(f, hdr.Syms)
+			if err == nil {
+				// Try to find main function
+				if foundMain := aout.FindMainSymbol(symbols, argv0); foundMain != 0 {
+					mainAddr = foundMain
+					fmt.Printf("[exec] Found main symbol at 0x%x\n", mainAddr)
+				} else {
+					fmt.Printf("[exec] Main symbol not found, using entry point 0x%x\n", uint64(hdr.Entry))
+				}
+			}
+		}
+	}
+
 	// Constants
 	const segAlign = 0x200000
 	const BaseAddr = 0x200000
@@ -75,22 +94,51 @@ func (k *Kernel) handleExec(mu unicorn.Unicorn, rsp uint64) {
 	mu.MemWrite(BaseAddr, textSegment)
 	mu.MemWrite(BaseAddr+uint64(dataOffset), dataSegment)
 
-	// For now, use entry point as main address
-	// TODO: Implement proper symbol table lookup
-	mainAddr := uint64(hdr.Entry)
-
-	// Set up simplified argv (just argc for now)
+	// Set up proper argv array for the new process
 	rspVal, _ := mu.RegRead(unicorn.X86_REG_RSP)
 	stackTop := rspVal
 
-	// Write argc at RSP+0xb0
-	argcBuf := make([]byte, 4)
-	binary.LittleEndian.PutUint32(argcBuf, uint32(len(argv)))
-	mu.MemWrite(stackTop+0xb0, argcBuf)
+	// Reserve space for argv array on stack
+	// Plan 9 expects: [argc][argv[0]][argv[1]]...[argv[n-1]][NULL]
+	argvAddrs := make([]uint64, len(argv))
+	currentStack := stackTop - 0x100 // Reserve stack space
 
-	// Set registers
+	// First, write all argument strings to stack
+	for i, arg := range argv {
+		argBytes := []byte(arg + "\x00")
+		currentStack -= uint64(len(argBytes))
+		currentStack &= ^uint64(7) // 8-byte align
+		mu.MemWrite(currentStack, argBytes)
+		argvAddrs[i] = currentStack
+	}
+
+	// Now write argv array (pointers to strings)
+	argvArrayStart := currentStack - uint64((len(argv)+1)*8)
+	argvArrayStart &= ^uint64(7)
+
+	for i, addr := range argvAddrs {
+		addrBytes := make([]byte, 8)
+		binary.LittleEndian.PutUint64(addrBytes, addr)
+		mu.MemWrite(argvArrayStart+uint64(i*8), addrBytes)
+	}
+
+	// Write NULL terminator at end of argv array
+	nullTerm := make([]byte, 8)
+	mu.MemWrite(argvArrayStart+uint64(len(argv)*8), nullTerm)
+
+	// Write argc at a known location (standard Plan 9 location)
+	argcBuf := make([]byte, 8)
+	binary.LittleEndian.PutUint64(argcBuf, uint64(len(argv)))
+	mu.MemWrite(stackTop-0x100, argcBuf)
+
+	// Set up registers for new process
 	mu.RegWrite(unicorn.X86_REG_RIP, uint64(hdr.Entry)) // Entry point
 	mu.RegWrite(unicorn.X86_REG_RCX, mainAddr)          // main() function
+	mu.RegWrite(unicorn.X86_REG_RDX, argvArrayStart)     // argv array pointer
+	mu.RegWrite(unicorn.X86_REG_R8, uint64(len(argv)))   // argc
+
+	fmt.Printf("[exec] Starting process: argv[0]=%s, argc=%d\n", argv[0], len(argv))
+	fmt.Printf("[exec] Entry point: 0x%x, main: 0x%x, argv: 0x%x\n", uint64(hdr.Entry), mainAddr, argvArrayStart)
 
 	// Success
 	setReturn(mu, 0)

@@ -317,3 +317,12 @@ func (pm *ProcessManager) SetProcessExit(pid uint64, status int) {
 		proc.State = ProcessExited
 	}
 }
+
+// handleFsession implements _FSESSION syscall (9) - File session
+func (k *Kernel) handleFsession(mu unicorn.Unicorn, rsp uint64) {
+	// For now, this is a stub
+	// In Plan 9, this is used for session management with file servers
+	// We just return success
+
+	setReturn(mu, 0)
+}

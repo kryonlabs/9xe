@@ -37,6 +37,12 @@ func (r Rectangle) Dy() int32 {
 	return r.Max.Y - r.Min.Y
 }
 
+// In returns true if p is inside the rectangle
+func (r Rectangle) In(p Point) bool {
+	return p.X >= r.Min.X && p.X < r.Max.X &&
+		p.Y >= r.Min.Y && p.Y < r.Max.Y
+}
+
 // Channel format constants from Plan 9
 const (
 	GREY1  = 0x01 // 1-bit greyscale
@@ -82,6 +88,8 @@ type Image struct {
 type Screen struct {
 	ID      int
 	Image   *Image
+	Fill    *Image    // Background fill image
+	Public  bool      // Whether screen is public
 	Windows []*Window
 	Backend GraphicsBackend
 }
@@ -101,4 +109,42 @@ type GraphicsBackend interface {
 	Update(rect Rectangle, data []byte) error
 	Flush() error
 	Close() error
+	PollEvents() []Event // For Phase 6: Event system
+	WaitEvent() Event     // Blocking wait for next event
+}
+
+// Event represents a graphics event (mouse, keyboard, etc.)
+type Event struct {
+	Type EventType
+	Mouse MouseState
+	Key   KeyState
+}
+
+// EventType represents the type of event
+type EventType int
+
+const (
+	MouseEvent EventType = iota
+	KeyEvent
+	QuitEvent
+	ResizeEvent
+	RefreshEvent
+)
+
+// MouseState represents mouse position and button state
+type MouseState struct {
+	X        int32
+	Y        int32
+	Buttons  uint32 // Button mask
+	Modifiers uint32 // Modifier keys
+}
+
+// KeyState represents keyboard state
+type KeyState struct {
+	Code  uint16 // Scancode
+	Rune  rune   // Unicode character
+	Down  bool   // True if key pressed, false if released
+	Ctrl  bool
+	Shift bool
+	Alt   bool
 }

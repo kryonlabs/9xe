@@ -142,7 +142,7 @@ func ReadSymbolTable(r io.Reader, numBytes uint32) ([]Symbol, error) {
 // Plan 9 binaries can have various entry point names: main, <binary_name>, etc.
 func FindMainSymbol(symbols []Symbol, binaryName string) uint64 {
     // Try common entry point names
-    possibleNames := []string{"main", "_main", "mainp"}
+    possibleNames := []string{"main", "_main", "mainp", "(main"}
 
     // Add binary name without path
     if len(binaryName) > 0 {
@@ -159,8 +159,13 @@ func FindMainSymbol(symbols []Symbol, binaryName string) uint64 {
     // Search for any of the possible names
     for _, name := range possibleNames {
         for _, sym := range symbols {
-            if sym.Name == name && (sym.Type == 'T' || sym.Type == 't' || sym.Type == 0xd4 || sym.Type == 0xb4) {
-                return sym.Value
+            // Match by name and type (expanded to include type 0x00 and other variants)
+            if sym.Name == name {
+                // Accept various text symbol types
+                if sym.Type == 'T' || sym.Type == 't' || sym.Type == 'L' || sym.Type == 'l' ||
+                   sym.Type == 0xd4 || sym.Type == 0xb4 || sym.Type == 0x5f || sym.Type == 0x00 {
+                    return sym.Value
+                }
             }
         }
     }

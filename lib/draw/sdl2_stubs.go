@@ -42,3 +42,15 @@ func (b *SDL2Backend) Close() error {
 	b.initialized = false
 	return nil
 }
+
+// PollEvents returns no events in stub mode
+func (b *SDL2Backend) PollEvents() []Event {
+	// Return empty slice - no events in stub mode
+	return []Event{}
+}
+
+// WaitEvent blocks forever in stub mode (should not be called)
+func (b *SDL2Backend) WaitEvent() Event {
+	// In stub mode, just return quit event to avoid hanging
+	return Event{Type: QuitEvent}
+}

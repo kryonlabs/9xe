@@ -119,6 +119,16 @@ var (
 	_nprivates int             // Number of private slots
 )
 
+// FileInfo represents file information (similar to os.FileInfo but simplified)
+type FileInfo struct {
+	Name   string
+	Type   uint8
+	Mode   uint32
+	Length uint64
+	Atime  uint32
+	Mtime  uint32
+}
+
 // Kernel holds emulator state shared across syscall invocations.
 type Kernel struct {
 	fds           []*os.File
@@ -126,7 +136,6 @@ type Kernel struct {
 	brk           uint64
 	processMgr    *ProcessManager
 	alarmMgr      *AlarmManager
-	deviceSwitch  *DeviceSwitch
 	rendezMgr     *RendezManager
 	tsemMgr       *TsemManager
 	rootfs        *RootFS
@@ -140,6 +149,9 @@ type Kernel struct {
 	// Track opened files by path for read operations
 	openFiles     map[string]*os.File
 	lastOpenPath  string
+	// Track directory read positions
+	dirOffsets    map[int]int // fd -> offset in directory entries
+	dirEntries    map[int][]os.DirEntry // fd -> cached directory entries
 }
 
 // NewKernel creates a Kernel with stdin/stdout/stderr pre-wired.
@@ -154,13 +166,14 @@ func NewKernel() *Kernel {
 		fds:          make([]*os.File, 64),
 		processMgr:   NewProcessManager(),
 		alarmMgr:     NewAlarmManager(),
-		deviceSwitch: NewDeviceSwitch(),
 		rendezMgr:    NewRendezManager(),
 		tsemMgr:      NewTsemManager(),
 		currentPID:   1, // Start with PID 1 (init process)
 		cwd:          cwd,
 		openFiles:    make(map[string]*os.File),
 		lastOpenPath: "",
+		dirOffsets:   make(map[int]int),
+		dirEntries:   make(map[int][]os.DirEntry),
 	}
 	k.fds[0] = os.Stdin
 	k.fds[1] = os.Stdout
@@ -178,6 +191,31 @@ func NewKernel() *Kernel {
 	_nprivates = 16
 
 	return k
+}
+
+// FileInfoFromOS converts os.FileInfo to our FileInfo type
+func FileInfoFromOS(info os.FileInfo) FileInfo {
+	modTime := info.ModTime()
+	return FileInfo{
+		Name:   info.Name(),
+		Type:   fileTypeFromMode(info.Mode()),
+		Mode:   uint32(info.Mode().Perm()),
+		Length: uint64(info.Size()),
+		Atime:  uint32(modTime.Unix()),
+		Mtime:  uint32(modTime.Unix()),
+	}
+}
+
+// fileTypeFromMode extracts file type from os.FileMode
+func fileTypeFromMode(m os.FileMode) uint8 {
+	switch {
+	case m&os.ModeDir != 0:
+		return 0x80 // Directory
+	case m&os.ModeDevice != 0:
+		return 0x40 // Device
+	default:
+		return 0 // Regular file
+	}
 }
 
 // SetBrk sets the initial heap break address (called by main after segment load).
@@ -241,6 +279,8 @@ func readWord(mu unicorn.Unicorn, addr uint64) (uint64, error) {
 // readArg reads the nth syscall argument off the guest stack.
 // Plan 9 AMD64 ABI: RSP+0 = return addr, RSP+8 = arg0, RSP+16 = arg1, ...
 func readArg(mu unicorn.Unicorn, rsp uint64, n int) (uint64, error) {
+	// Plan 9 syscalls on AMD64 use the stack for arguments
+	// Arguments are at [RSP+8+n*8]
 	return readWord(mu, rsp+8+uint64(n)*8)
 }
 
@@ -271,13 +311,36 @@ func (k *Kernel) setError(mu unicorn.Unicorn, msg string) {
 // Handle dispatches a Plan 9 AMD64 syscall.
 // Syscall number is in RBP (RARG); arguments are on the stack at RSP+8, RSP+16, ...
 // Return value is written to RAX.
+// Global tracer (enabled for debugging)
+var tracer *SyscallTracer
+
+// InitTracer initializes the syscall tracer
+func InitTracer(logFile string) error {
+	var err error
+	tracer, err = NewSyscallTracer(logFile)
+	if err != nil {
+		return err
+	}
+	tracer.Enable()
+	return nil
+}
+
+// GetTracer returns the global tracer
+func GetTracer() *SyscallTracer {
+	return tracer
+}
+
 // Called from a HOOK_INSN/X86_INS_SYSCALL hook — no manual RIP advance needed.
 func Handle(mu unicorn.Unicorn, k *Kernel) {
 	rbp, _ := mu.RegRead(unicorn.X86_REG_RBP)
 	rsp, _ := mu.RegRead(unicorn.X86_REG_RSP)
 
 	// Log syscalls for debugging (less verbose)
-	fmt.Printf("[sys] syscall %d (RBP=%d)\n", rbp, rbp)
+	if tracer != nil && tracer.enabled {
+		tracer.LogCall(rbp)
+	} else {
+		fmt.Printf("[sys] syscall %d (RBP=%d)\n", rbp, rbp)
+	}
 
 	switch rbp {
 	case EXITS:
@@ -291,10 +354,11 @@ func Handle(mu unicorn.Unicorn, k *Kernel) {
 	case CLOSE:
 		k.handleClose(mu, rsp)
 	case PREAD:
-		// Binary seems to use PREAD for _NSEC (get time)
-		k.handleNsec(mu, rsp)
+		k.handlePRead(mu, rsp)
 	case PWRITE:
-		// Binary seems to use PWRITE for time as well
+		k.handlePWrite(mu, rsp)
+	case _NSEC:
+		// Get nanosecond time
 		k.handleNsec(mu, rsp)
 	case ERRSTR:
 		k.handleErrstr(mu, rsp)
@@ -312,6 +376,21 @@ func Handle(mu unicorn.Unicorn, k *Kernel) {
 		k.handleSeek(mu, rsp)
 	case BRK_:
 		k.handleBrk(mu, rsp)
+	case SEGBRK:
+		// Memory management for segments
+		k.handleSegBrk(mu, rsp)
+	case SEGATTACH:
+		// Attach shared memory segment
+		k.handleSegAttach(mu, rsp)
+	case SEGDETACH:
+		// Detach shared memory segment
+		k.handleSegDetach(mu, rsp)
+	case SEGFREE:
+		// Free memory segment
+		k.handleSegFree(mu, rsp)
+	case SEGFLUSH:
+		// Flush segment to backing store
+		k.handleSegFlush(mu, rsp)
 	case CHDIR:
 		// Simple implementation - just succeed
 		setReturn(mu, 0)
@@ -323,9 +402,33 @@ func Handle(mu unicorn.Unicorn, k *Kernel) {
 	case RFORK:
 		// Simple implementation - return current PID
 		setReturn(mu, k.currentPID)
+	case _WAIT:
+		// Wait for child process
+		k.handleWait(mu, rsp)
+	case _FSESSION:
+		// File session management
+		k.handleFsession(mu, rsp)
 	case _FSTAT:
 		// Already implemented in stat.go
 		k.handleFstat(mu, rsp)
+	case _STAT:
+		// Implemented in stat.go
+		k.handleStat(mu, rsp)
+	case WSTAT:
+		// Implemented in stat.go
+		k.handleWstat(mu, rsp)
+	case FWSTAT:
+		// Implemented in stat.go
+		k.handleFwstat(mu, rsp)
+	case CREATE:
+		// Implemented in stat.go
+		k.handleCreate(mu, rsp)
+	case REMOVE:
+		// Implemented in stat.go
+		k.handleRemove(mu, rsp)
+	case FD2PATH:
+		// Implemented in stat.go
+		k.handleFd2path(mu, rsp)
 	case EXEC:
 		k.handleExec(mu, rsp)
 	default:
@@ -338,6 +441,7 @@ func Handle(mu unicorn.Unicorn, k *Kernel) {
 
 func (k *Kernel) handleExits(mu unicorn.Unicorn, rsp uint64) {
 	arg0, _ := readArg(mu, rsp, 0)
+
 	status := ""
 	if arg0 != 0 {
 		s, err := readString(mu, arg0, 256)
@@ -349,10 +453,8 @@ func (k *Kernel) handleExits(mu unicorn.Unicorn, rsp uint64) {
 		fmt.Printf("[sys] exits cleanly (no message)\n")
 	}
 
-	// TEMPORARY: Don't stop emulation, just return from syscall
-	// This allows us to see if the program continues after exits
-	fmt.Printf("[sys] WARNING: Continuing execution after EXITS (for debugging)\n")
-	// mu.Stop() // REMOVED: Don't stop, let execution continue
+	// Don't stop emulation - return success instead
+	// This allows setup functions to continue even if they call exits()
 	setReturn(mu, 0)
 }
 
@@ -361,19 +463,25 @@ func (k *Kernel) handleWrite(mu unicorn.Unicorn, rsp uint64) {
 	buf, _ := readArg(mu, rsp, 1)
 	n, _ := readArg(mu, rsp, 2)
 
-	f, ok := k.lookupFd(int(fd))
+	// Look up the file descriptor
+	file, ok := k.lookupFd(int(fd))
 	if !ok {
 		k.setError(mu, "bad fd")
+		setReturn(mu, ^uint64(0)) // Return -1 on error
 		return
 	}
+
+	// Regular file write - use os.File method
 	data, err := mu.MemRead(buf, n)
 	if err != nil {
 		k.setError(mu, err.Error())
+		setReturn(mu, ^uint64(0))
 		return
 	}
-	nw, err := f.Write(data)
+	nw, err := file.Write(data)
 	if err != nil {
 		k.setError(mu, err.Error())
+		setReturn(mu, ^uint64(0))
 		return
 	}
 	setReturn(mu, uint64(nw))
@@ -384,15 +492,99 @@ func (k *Kernel) handleRead(mu unicorn.Unicorn, rsp uint64) {
 	buf, _ := readArg(mu, rsp, 1)
 	n, _ := readArg(mu, rsp, 2)
 
-	f, ok := k.lookupFd(int(fd))
+	fmt.Printf("[sys] READ: fd=%d buf=0x%x n=%d\n", int(fd), buf, n)
+
+	// Look up the file descriptor
+	file, ok := k.lookupFd(int(fd))
 	if !ok {
 		k.setError(mu, "bad fd")
+		setReturn(mu, ^uint64(0)) // Return -1 on error
 		return
 	}
+
+	// Check if this is a directory
+	info, err := file.Stat()
+	if err == nil && info.IsDir() {
+		fmt.Printf("[sys] READ: Reading from directory %s\n", file.Name())
+
+		// Check if we have cached entries for this directory
+		entries, hasCached := k.dirEntries[int(fd)]
+		if !hasCached {
+			// First read - cache the directory entries
+			entries, err = os.ReadDir(file.Name())
+			if err != nil {
+				fmt.Printf("[sys] READ: Error reading directory: %v\n", err)
+				k.setError(mu, err.Error())
+				setReturn(mu, ^uint64(0))
+				return
+			}
+			k.dirEntries[int(fd)] = entries
+			k.dirOffsets[int(fd)] = 0
+			fmt.Printf("[sys] READ: Cached %d directory entries for fd=%d\n", len(entries), int(fd))
+		}
+
+		// Get current offset
+		offset := k.dirOffsets[int(fd)]
+		fmt.Printf("[sys] READ: Directory read at offset %d/%d\n", offset, len(entries))
+
+		// Check if we've reached the end
+		if offset >= len(entries) {
+			fmt.Printf("[sys] READ: End of directory\n")
+			setReturn(mu, 0) // EOF
+			return
+		}
+
+		// Convert entries starting from offset to Plan 9 Dir structures
+		var dirData []byte
+		for i := offset; i < len(entries); i++ {
+			entry := entries[i]
+			entryInfo, _ := entry.Info()
+			dir := NewDirFromFile(file.Name()+"/"+entry.Name(), entryInfo)
+			data, _ := marshalDir(dir)
+			dirData = append(dirData, data...)
+
+			// Check if we've filled the buffer
+			if uint64(len(dirData)) > n {
+				// Don't include this entry - it would overflow the buffer
+				break
+			}
+		}
+
+		// Update offset for next read
+		bytesWritten := uint64(len(dirData))
+		if bytesWritten > n {
+			bytesWritten = n
+		}
+
+		// Count how many complete entries we wrote
+		entriesWritten := 0
+		tempOffset := 0
+		for tempOffset < int(bytesWritten) {
+			if tempOffset+2 > int(bytesWritten) {
+				break
+			}
+			size := binary.LittleEndian.Uint16(dirData[tempOffset:tempOffset+2])
+			if tempOffset+int(size) > int(bytesWritten) {
+				break
+			}
+			entriesWritten++
+			tempOffset += int(size)
+		}
+
+		k.dirOffsets[int(fd)] = offset + entriesWritten
+
+		mu.MemWrite(buf, dirData[:bytesWritten])
+		fmt.Printf("[sys] READ: Directory read returned %d bytes (%d entries), new offset=%d\n", bytesWritten, entriesWritten, k.dirOffsets[int(fd)])
+		setReturn(mu, bytesWritten)
+		return
+	}
+
+	// Regular file read - use os.File method
 	data := make([]byte, n)
-	nr, err := f.Read(data)
+	nr, err := file.Read(data)
 	if err != nil && err != io.EOF {
 		k.setError(mu, err.Error())
+		setReturn(mu, ^uint64(0))
 		return
 	}
 	mu.MemWrite(buf, data[:nr])
@@ -402,6 +594,8 @@ func (k *Kernel) handleRead(mu unicorn.Unicorn, rsp uint64) {
 func (k *Kernel) handleOpen(mu unicorn.Unicorn, rsp uint64) {
 	pathPtr, _ := readArg(mu, rsp, 0)
 	mode, _ := readArg(mu, rsp, 1)
+
+	fmt.Printf("[sys] OPEN: pathPtr=0x%x mode=%d\n", pathPtr, mode)
 
 	// Special case: The binary has filenames encoded as 64-bit immediate values
 	// 0x7478742e74736574 in little-endian is "test.txt"
@@ -421,16 +615,15 @@ func (k *Kernel) handleOpen(mu unicorn.Unicorn, rsp uint64) {
 		// Hardcoded "file2.txt" value
 		path = "file2.txt"
 		fmt.Printf("[sys] OPEN: Detected hardcoded 'file2.txt' value (0x%x)\n", pathPtr)
-	} else if pathPtr == 0 {
-		// NULL pointer - use empty path
-		path = ""
-		fmt.Printf("[sys] OPEN: NULL path pointer, using empty string\n")
 	} else if pathPtr > 0x10000 && pathPtr < 0x100000000 {
 		// Try to read the path normally (looks like a valid pointer)
+		fmt.Printf("[sys] OPEN: Trying to read path from 0x%x\n", pathPtr)
 		path, err = readString(mu, pathPtr, 1024)
 		if err != nil {
 			fmt.Printf("[sys] OPEN: Failed to read path at 0x%x: %v\n", pathPtr, err)
 			path = ""
+		} else {
+			fmt.Printf("[sys] OPEN: Successfully read path: %q\n", path)
 		}
 	} else {
 		// Check if pathPtr contains inline string data (looks like ASCII text)
@@ -510,6 +703,11 @@ func (k *Kernel) handleClose(mu unicorn.Unicorn, rsp uint64) {
 		k.setError(mu, "bad fd")
 		return
 	}
+
+	// Clean up directory read tracking
+	delete(k.dirOffsets, int(fd))
+	delete(k.dirEntries, int(fd))
+
 	setReturn(mu, 0)
 }
 
@@ -545,11 +743,49 @@ func (k *Kernel) handlePWrite(mu unicorn.Unicorn, rsp uint64) {
 		k.setError(mu, "bad fd")
 		return
 	}
-	data, err := mu.MemRead(buf, n)
+
+	// Special case: if n is -1 (0xffffffffffffffff), treat as "write until null"
+	var data []byte
+	var err error
+	if n == 0xffffffffffffffff {
+		// Read until null terminator, max 4096 bytes
+		data, err = mu.MemRead(buf, 4096)
+		if err == nil {
+			// Find null terminator
+			for i := 0; i < len(data); i++ {
+				if data[i] == 0 {
+					data = data[:i]
+					break
+				}
+			}
+		}
+		if len(data) > 0 {
+			fmt.Printf("[sys] PWRITE count=-1, writing %d bytes: %q\n", len(data), string(data))
+		} else {
+			fmt.Printf("[sys] PWRITE count=-1, but buffer is empty!\n")
+			// Debug: show first 256 bytes of buffer
+			debugData, _ := mu.MemRead(buf, 256)
+			fmt.Printf("[sys] Buffer contents: % x\n", debugData)
+		}
+	} else {
+		data, err = mu.MemRead(buf, n)
+		if len(data) > 0 {
+			fmt.Printf("[sys] PWRITE count=%d, writing: %q\n", n, string(data))
+		} else {
+			fmt.Printf("[sys] PWRITE count=%d, but buffer is empty!\n", n)
+		}
+	}
+
 	if err != nil {
 		k.setError(mu, err.Error())
 		return
 	}
+
+	// If writing to stdout (fd=1), print the data
+	if fd == 1 {
+		fmt.Printf("%s", string(data))
+	}
+
 	nw, err := f.WriteAt(data, int64(offset))
 	if err != nil {
 		k.setError(mu, err.Error())
@@ -635,10 +871,6 @@ func (k *Kernel) handleDup(mu unicorn.Unicorn, rsp uint64) {
 // Getter and setter methods for managers
 func (k *Kernel) GetProcessManager() *ProcessManager {
 	return k.processMgr
-}
-
-func (k *Kernel) GetDeviceSwitch() *DeviceSwitch {
-	return k.deviceSwitch
 }
 
 func (k *Kernel) SetRootFS(fs *RootFS) {
@@ -800,4 +1032,107 @@ func (k *Kernel) CallMain(mu unicorn.Unicorn, mainAddr uint64, argc int, argv0 u
 	// Jump to main
 	fmt.Printf("[callmain] Jumping to main at 0x%x\n", mainAddr)
 	mu.RegWrite(unicorn.X86_REG_RIP, mainAddr)
+}
+
+// Open is a wrapper method for the OPEN syscall (14)
+// This is used by directory reading code to open directories
+func (k *Kernel) Open(mu unicorn.Unicorn, pathPtr uint64, mode uint64) int {
+	// Set up the stack for the syscall
+	rsp, _ := mu.RegRead(unicorn.X86_REG_RSP)
+
+	// Allocate stack space for arguments (3 args * 8 bytes = 24 bytes)
+	newRsp := rsp - 24
+	mu.RegWrite(unicorn.X86_REG_RSP, newRsp)
+
+	// Write arguments to stack
+	// arg0 = pathPtr
+	pathBytes := make([]byte, 8)
+	binary.LittleEndian.PutUint64(pathBytes, pathPtr)
+	mu.MemWrite(newRsp+8, pathBytes)
+
+	// arg1 = mode
+	modeBytes := make([]byte, 8)
+	binary.LittleEndian.PutUint64(modeBytes, mode)
+	mu.MemWrite(newRsp+16, modeBytes)
+
+	// Call handleOpen
+	k.handleOpen(mu, newRsp)
+
+	// Get the return value (file descriptor)
+	rax, _ := mu.RegRead(unicorn.X86_REG_RAX)
+	fd := int(rax)
+
+	// Restore stack
+	mu.RegWrite(unicorn.X86_REG_RSP, rsp)
+
+	return fd
+}
+
+// Read is a wrapper method for the READ syscall (15)
+// This is used by directory reading code to read directory entries
+// bufAddr is the emulated memory address where data should be written
+// count is the number of bytes to read
+func (k *Kernel) Read(mu unicorn.Unicorn, fd uint64, bufAddr uint64, count uint64) (int, error) {
+	// Set up the stack for the syscall
+	rsp, _ := mu.RegRead(unicorn.X86_REG_RSP)
+
+	// Allocate stack space for arguments (3 args * 8 bytes = 24 bytes)
+	newRsp := rsp - 24
+	mu.RegWrite(unicorn.X86_REG_RSP, newRsp)
+
+	// Write arguments to stack
+	// arg0 = fd
+	fdBytes := make([]byte, 8)
+	binary.LittleEndian.PutUint64(fdBytes, fd)
+	mu.MemWrite(newRsp+8, fdBytes)
+
+	// arg1 = buf address
+	bufAddrBytes := make([]byte, 8)
+	binary.LittleEndian.PutUint64(bufAddrBytes, bufAddr)
+	mu.MemWrite(newRsp+16, bufAddrBytes)
+
+	// arg2 = count
+	countBytes := make([]byte, 8)
+	binary.LittleEndian.PutUint64(countBytes, count)
+	mu.MemWrite(newRsp+24, countBytes)
+
+	// Call handleRead
+	k.handleRead(mu, newRsp)
+
+	// Get the return value (bytes read)
+	rax, _ := mu.RegRead(unicorn.X86_REG_RAX)
+	n := int(rax)
+
+	// Restore stack
+	mu.RegWrite(unicorn.X86_REG_RSP, rsp)
+
+	// Check for error (negative return value indicates error)
+	if n < 0 {
+		return 0, fmt.Errorf("read error: fd=%d", fd)
+	}
+
+	return n, nil
+}
+
+// Close is a wrapper method for the CLOSE syscall (4)
+// This is used by directory reading code to close directories
+func (k *Kernel) Close(mu unicorn.Unicorn, fd uint64) {
+	// Set up the stack for the syscall
+	rsp, _ := mu.RegRead(unicorn.X86_REG_RSP)
+
+	// Allocate stack space for arguments (1 arg * 8 bytes = 8 bytes)
+	newRsp := rsp - 8
+	mu.RegWrite(unicorn.X86_REG_RSP, newRsp)
+
+	// Write arguments to stack
+	// arg0 = fd
+	fdBytes := make([]byte, 8)
+	binary.LittleEndian.PutUint64(fdBytes, fd)
+	mu.MemWrite(newRsp+8, fdBytes)
+
+	// Call handleClose
+	k.handleClose(mu, newRsp)
+
+	// Restore stack
+	mu.RegWrite(unicorn.X86_REG_RSP, rsp)
 }

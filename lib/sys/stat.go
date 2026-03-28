@@ -206,6 +206,7 @@ func (k *Kernel) handleFstat(mu unicorn.Unicorn, rsp uint64) {
 		return
 	}
 
+	// Regular file - try to get os.FileInfo
 	info, err := f.Stat()
 	if err != nil {
 		k.setError(mu, err.Error())
@@ -273,6 +274,50 @@ func NewDirFromFile(path string, info os.FileInfo) *Dir {
 	return dir
 }
 
+// NewDirFromSysFileInfo creates a Plan 9 Dir from our sys.FileInfo type
+// This is used for virtual files like DrawFile
+func NewDirFromSysFileInfo(info FileInfo) *Dir {
+	dir := &Dir{
+		Name:   info.Name,
+		Length: info.Length,
+		Atime:  info.Atime,
+		Mtime:  info.Mtime,
+		Uid:    "glenda", // Default Plan 9 user
+		Gid:    "glenda", // Default Plan 9 group
+		Muid:   "",
+	}
+
+	// Set type based on Type field
+	if info.Type == 0x80 { // Directory
+		dir.Type = MTYPEDIR
+		dir.Mode = DMREAD | DMEXEC | 0111 // Directory is read/execute
+	} else if info.Type == 1 { // Device
+		dir.Type = MTYPEFILE
+		dir.Mode = DMREAD | DMWRITE // Device files are read/write
+	} else {
+		dir.Type = MTYPEFILE
+		dir.Mode = DMREAD | DMWRITE // Default to read/write
+	}
+
+	// Set permissions from Mode field
+	if info.Mode&0400 != 0 {
+		dir.Mode |= DMREAD
+	}
+	if info.Mode&0200 != 0 {
+		dir.Mode |= DMWRITE
+	}
+	if info.Mode&0100 != 0 {
+		dir.Mode |= DMEXEC
+	}
+
+	// Set Qid - use a simple hash of name as path
+	dir.Qid.Path = uint64(len(info.Name)) // Simple unique ID
+	dir.Qid.Vers = 0
+	dir.Qid.Type = uint8(dir.Type)
+
+	return dir
+}
+
 // statToDir converts os.FileInfo to Plan 9 Dir (legacy function, uses NewDirFromFile)
 func statToDir(info os.FileInfo, path string) *Dir {
 	return NewDirFromFile(path, info)
@@ -320,4 +365,83 @@ func marshalDir(dir *Dir) ([]byte, int) {
 	copy(buf[43:], dir.Name)
 
 	return buf, totalSize
+}
+
+// handleWstat implements WSTAT syscall (44) - Write stat info
+func (k *Kernel) handleWstat(mu unicorn.Unicorn, rsp uint64) {
+	namePtr, _ := readArg(mu, rsp, 0)
+	edir, _ := readArg(mu, rsp, 1)
+	nedd, _ := readArg(mu, rsp, 2)
+
+	_, err := readString(mu, namePtr, 1024)
+	if err != nil {
+		k.setError(mu, "bad path ptr")
+		return
+	}
+
+	// Read the Dir data from memory
+	data, err := mu.MemRead(edir, nedd)
+	if err != nil {
+		k.setError(mu, "bad edir ptr")
+		return
+	}
+
+	// For now, just acknowledge receipt
+	// TODO: Implement actual stat modification (chmod, chown, etc.)
+	_ = data // Use the data to avoid "declared and not used" error
+	setReturn(mu, 0)
+}
+
+// handleFwstat implements FWSTAT syscall (45) - Write stat info for open file
+func (k *Kernel) handleFwstat(mu unicorn.Unicorn, rsp uint64) {
+	fd, _ := readArg(mu, rsp, 0)
+	edir, _ := readArg(mu, rsp, 1)
+	nedd, _ := readArg(mu, rsp, 2)
+
+	// Check if fd is valid
+	_, ok := k.lookupFd(int(fd))
+	if !ok {
+		k.setError(mu, "bad fd")
+		return
+	}
+
+	// Read the Dir data from memory
+	data, err := mu.MemRead(edir, nedd)
+	if err != nil {
+		k.setError(mu, "bad edir ptr")
+		return
+	}
+
+	// For now, just acknowledge receipt
+	// TODO: Implement actual stat modification (chmod, chown, etc.)
+	_ = data // Use the data to avoid "declared and not used" error
+	setReturn(mu, 0)
+}
+
+// handleFd2path implements FD2PATH syscall (23) - Get path from fd
+func (k *Kernel) handleFd2path(mu unicorn.Unicorn, rsp uint64) {
+	fd, _ := readArg(mu, rsp, 0)
+	bufPtr, _ := readArg(mu, rsp, 1)
+	n, _ := readArg(mu, rsp, 2)
+
+	// Check if fd is valid
+	f, ok := k.lookupFd(int(fd))
+	if !ok {
+		k.setError(mu, "bad fd")
+		return
+	}
+
+	// Get the file path
+	path := f.Name()
+
+	// Ensure path fits in buffer
+	pathBytes := []byte(path)
+	if uint64(len(pathBytes)) > n {
+		k.setError(mu, "path too long")
+		return
+	}
+
+	// Write path to buffer
+	mu.MemWrite(bufPtr, pathBytes)
+	setReturn(mu, uint64(len(pathBytes)))
 }

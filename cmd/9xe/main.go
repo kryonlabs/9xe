@@ -463,8 +463,9 @@ func setupHooks(mu unicorn.Unicorn, kernel *sys.Kernel, hdr *aout.Header, TextAd
 		}
 
 		// SPECIAL CASE: Detect when entry function is about to return
-		// The entry function is at 0x2002d2 and returns at 0x2002f4
-		if addr == 0x2002f4 {
+		// The entry function is at 0x2002d2 and returns at 0x2002f4 (for ls/cat/date)
+		// mkdir has a different entry function at 0x2001a8 that returns to 0x2001f5
+		if addr == 0x2002f4 || addr == 0x2001f5 {
 			fmt.Printf("\n[SUCCESS] Entry function returning at 0x%x\n", addr)
 			fmt.Printf("[SUCCESS] Program execution completed\n")
 			fmt.Printf("[SUCCESS] Stopping emulation cleanly\n")
@@ -694,6 +695,58 @@ func setupHooks(mu unicorn.Unicorn, kernel *sys.Kernel, hdr *aout.Header, TextAd
 				mu.RegWrite(unicorn.X86_REG_RIP, continueAddr)
 				return
 			}
+		}
+
+		// Stub for mkdir's directory creation function at 0x208265
+		// This function is called but is incomplete/stubbed
+		if addr == 0x208265 {
+			fmt.Printf("[MKDIR] Directory creation function called at 0x%x\n", addr)
+
+			// Get the directory path from argv[1]
+			argvArray := globalArgvArrayAddr
+			argv1PtrBytes, _ := mu.MemRead(argvArray+8, 8)
+			argv1Ptr := binary.LittleEndian.Uint64(argv1PtrBytes)
+
+			// Read the path string
+			var path string
+			if argv1Ptr != 0 {
+				pathBytes, _ := mu.MemRead(argv1Ptr, 256)
+				nullPos := 256
+				for i := 0; i < 256; i++ {
+					if pathBytes[i] == 0 {
+						nullPos = i
+						break
+					}
+				}
+				path = string(pathBytes[:nullPos])
+			}
+
+			fmt.Printf("[MKDIR] Creating directory: %q\n", path)
+
+			// Create the directory using os.Mkdir
+			err := os.Mkdir(path, 0755)
+			if err != nil {
+				fmt.Printf("[MKDIR] Failed to create directory: %v\n", err)
+				// Return error (-1)
+				rsp, _ := mu.RegRead(unicorn.X86_REG_RSP)
+				retAddrBytes, _ := mu.MemRead(rsp, 8)
+				retAddr := binary.LittleEndian.Uint64(retAddrBytes)
+				mu.RegWrite(unicorn.X86_REG_RAX, ^uint64(0)) // Return -1 (error)
+				mu.RegWrite(unicorn.X86_REG_RSP, rsp+8)
+				mu.RegWrite(unicorn.X86_REG_RIP, retAddr)
+				return
+			}
+
+			fmt.Printf("[MKDIR] Successfully created directory: %q\n", path)
+
+			// Return to the caller with success (0)
+			rsp, _ := mu.RegRead(unicorn.X86_REG_RSP)
+			retAddrBytes, _ := mu.MemRead(rsp, 8)
+			retAddr := binary.LittleEndian.Uint64(retAddrBytes)
+			mu.RegWrite(unicorn.X86_REG_RAX, 0) // Return 0 (success)
+			mu.RegWrite(unicorn.X86_REG_RSP, rsp+8)
+			mu.RegWrite(unicorn.X86_REG_RIP, retAddr)
+			return
 		}
 
 

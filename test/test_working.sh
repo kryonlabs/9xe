@@ -74,6 +74,26 @@ else
     FAILED=$((FAILED + 1))
 fi
 
+# Test mkdir
+echo -e "\n${YELLOW}Test 5: mkdir - create directory${NC}"
+echo "Description: Should create a new directory"
+TEST_DIR="/tmp/9xe_test_mkdir_$$"
+if ./9xe /mnt/storage/Projects/TaijiOS/9xe/testbin/mkdir "$TEST_DIR" 2>&1 | strings | grep "Successfully created" > /dev/null 2>&1; then
+    if [ -d "$TEST_DIR" ]; then
+        echo -e "${GREEN}✓ PASSED${NC}"
+        PASSED=$((PASSED + 1))
+        rm -rf "$TEST_DIR"
+    else
+        echo -e "${RED}✗ FAILED${NC}"
+        echo "Directory not found"
+        FAILED=$((FAILED + 1))
+    fi
+else
+    echo -e "${RED}✗ FAILED${NC}"
+    echo "mkdir execution failed"
+    FAILED=$((FAILED + 1))
+fi
+
 # Clean up
 echo -e "\nCleaning up test files..."
 rm -rf "$TMP_DIR"

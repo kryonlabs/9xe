@@ -1,3 +1,7 @@
 9xe
 bin/
 testbin/
+file*.txt
+
+test_dir/
+

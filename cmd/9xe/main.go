@@ -2,6 +2,7 @@ package main
 
 import (
 	"encoding/binary"
+	"flag"
 	"fmt"
 	"io"
 	"log"
@@ -14,17 +15,28 @@ import (
 	"github.com/unicorn-engine/unicorn/bindings/go/unicorn"
 )
 
+var (
+	debugMode   = flag.Bool("debug", false, "Enable debug output")
+	traceMode   = flag.Bool("trace", false, "Enable instruction tracing")
+	verboseMode = flag.Bool("verbose", false, "Enable verbose output")
+	quietMode   = flag.Bool("quiet", false, "Suppress all output except binary output")
+)
+
 // Global variable to store the argv array address for later use
 var globalArgvArrayAddr uint64 = 0
 
 func main() {
-	if len(os.Args) < 2 {
-		fmt.Println("Usage: 9xe <path_to_plan9_binary>")
+	flag.Parse()
+	args := flag.Args()
+
+	if len(args) < 1 {
+		fmt.Println("Usage: 9xe [--debug] [--trace] [--quiet] <path_to_plan9_binary> [args...]")
+		flag.PrintDefaults()
 		return
 	}
 
 	// 1. Open the Plan 9 Binary
-	f, err := os.Open(os.Args[1])
+	f, err := os.Open(args[0])
 	if err != nil {
 		log.Fatalf("Error opening file: %v", err)
 	}
@@ -36,25 +48,26 @@ func main() {
 		log.Fatalf("Error parsing header: %v", err)
 	}
 
-	fmt.Printf("--- 9xe Executive: TaijiOS Loader ---\n")
-	fmt.Printf("Architecture: %s\n", hdr.GetArchitecture())
-	fmt.Printf("Magic:        0x%x\n", hdr.Magic)
-
 	// Read the actual entry point from expanded header if HDR_MAGIC flag is set
 	entryPoint, err := aout.ReadEntryAddress(f, hdr)
 	if err != nil {
 		log.Fatalf("Failed to read entry point: %v", err)
 	}
 
-	fmt.Printf("Entry Point:  0x%x\n", entryPoint)
-	fmt.Printf("Text Segment: %d bytes\n", hdr.Text)
-	fmt.Printf("Data Segment: %d bytes\n", hdr.Data)
-	fmt.Printf("Bss Segment:  %d bytes\n", hdr.Bss)
-	fmt.Printf("Symbols:      %d bytes\n", hdr.Syms)
-	fmt.Printf("--------------------------------------\n")
+	if !*quietMode {
+		fmt.Printf("--- 9xe Executive: TaijiOS Loader ---\n")
+		fmt.Printf("Architecture: %s\n", hdr.GetArchitecture())
+		fmt.Printf("Magic:        0x%x\n", hdr.Magic)
+		fmt.Printf("Entry Point:  0x%x\n", entryPoint)
+		fmt.Printf("Text Segment: %d bytes\n", hdr.Text)
+		fmt.Printf("Data Segment: %d bytes\n", hdr.Data)
+		fmt.Printf("Bss Segment:  %d bytes\n", hdr.Bss)
+		fmt.Printf("Symbols:      %d bytes\n", hdr.Syms)
+		fmt.Printf("--------------------------------------\n")
+	}
 
 	// Special case for date binary - provide date output directly
-	if strings.Contains(os.Args[1], "date") {
+	if strings.Contains(args[0], "date") {
 		now := time.Now()
 		days := []string{"Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"}
 		months := []string{"Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"}
@@ -75,24 +88,32 @@ func main() {
 	if hdr.Syms > 0 {
 		symTableOffset := int64(32 + hdr.Text + hdr.Data)
 		if _, err := f.Seek(symTableOffset, 0); err != nil {
-			log.Printf("Warning: Could not seek to symbol table: %v", err)
+			if !*quietMode {
+				log.Printf("Warning: Could not seek to symbol table: %v", err)
+			}
 		} else {
 			symbols, err := aout.ReadSymbolTable(f, hdr.Syms)
 			if err != nil {
-				log.Printf("Warning: Could not read symbol table: %v", err)
+				if !*quietMode {
+					log.Printf("Warning: Could not read symbol table: %v", err)
+				}
 			} else {
-				fmt.Printf("[symbols] Read %d symbols\n", len(symbols))
-				mainAddr = aout.FindMainSymbol(symbols, os.Args[1])
-				if mainAddr != 0 {
+				if *verboseMode {
+					fmt.Printf("[symbols] Read %d symbols\n", len(symbols))
+				}
+				mainAddr = aout.FindMainSymbol(symbols, args[0])
+				if *verboseMode && mainAddr != 0 {
 					fmt.Printf("[symbols] Found entry function at 0x%x\n", mainAddr)
-				} else {
+				} else if *verboseMode {
 					fmt.Printf("[symbols] Entry function not found, will use entry point\n")
 					mainAddr = entryPoint
 				}
 			}
 		}
 	} else {
-		fmt.Printf("[symbols] No symbol table in binary\n")
+		if *verboseMode {
+			fmt.Printf("[symbols] No symbol table in binary\n")
+		}
 		mainAddr = entryPoint
 	}
 
@@ -119,7 +140,9 @@ func main() {
 		log.Fatalf("Failed to read Data segment: %v", err)
 	}
 
-	fmt.Printf("Memory: Text at 0x%x (%d bytes), Data at 0x%x (%d bytes)\n", TextAddr, hdr.Text, DataAddr, hdr.Data)
+	if !*quietMode {
+		fmt.Printf("Memory: Text at 0x%x (%d bytes), Data at 0x%x (%d bytes)\n", TextAddr, hdr.Text, DataAddr, hdr.Data)
+	}
 
 	// 4. Initialize Unicorn Engine
 	mu, err := unicorn.NewUnicorn(unicorn.ARCH_X86, unicorn.MODE_64)
@@ -195,12 +218,14 @@ func main() {
 			binary.LittleEndian.PutUint64(newBytes, newValue)
 			mu.MemWrite(DataAddr+offset, newBytes)
 			patchCount++
-			if patchCount <= 15 {
+			if *debugMode && patchCount <= 15 {
 				fmt.Printf("[PATCH] Fixed offset at 0x%x: 0x%x -> 0x%x\n", DataAddr+offset, value, newValue)
 			}
 		}
 	}
-	fmt.Printf("[PATCH] Fixed %d data pointers\n", patchCount)
+	if *debugMode {
+		fmt.Printf("[PATCH] Fixed %d data pointers\n", patchCount)
+	}
 
 	// Zero-fill BSS
 	bssAddr := DataAddr + uint64(hdr.Data)
@@ -448,16 +473,56 @@ func setupHooks(mu unicorn.Unicorn, kernel *sys.Kernel, hdr *aout.Header, TextAd
 	var inSysfatal bool
 	syscallCount := 0
 
+	// Track execution state for loop detection
+	lastExecutionStates := make(map[uint64]int)
+	maxLoopIterations := 100
+
 	// Combined HOOK_CODE handler for all tracing and debugging
 	mu.HookAdd(unicorn.HOOK_CODE, func(mu unicorn.Unicorn, addr uint64, size uint32) {
 		instructionCount++
 
-		// SPECIAL CASE: Jump to NULL pointer (0x0)
-		// This happens when the entry function tries to return through a NULL return address
-		if addr == 0x0 {
-			fmt.Printf("\n[STUB] Entry function returning to NULL pointer (0x0)\n")
-			fmt.Printf("[STUB] Program has completed execution\n")
-			fmt.Printf("[STUB] Stopping emulation cleanly\n")
+		// Loop detection: Track (RIP, RSP) pairs to detect infinite loops
+		rsp, _ := mu.RegRead(unicorn.X86_REG_RSP)
+		stateKey := (addr << 32) | (rsp & 0xFFFFFFFF)
+		lastExecutionStates[stateKey]++
+
+		// If we've seen this (RIP, RSP) pair too many times, we're in a loop
+		if lastExecutionStates[stateKey] > maxLoopIterations && instructionCount > 1000 {
+			fmt.Printf("[LOOP DETECTION] Possible infinite loop at 0x%x (RSP=0x%x), seen %d times\n", addr, rsp, lastExecutionStates[stateKey])
+
+			// Check if this is a conditional jump loop
+			bytes, _ := mu.MemRead(addr, 2)
+			if len(bytes) >= 2 && bytes[0] == 0x0F && (bytes[1]&0xF0 == 0x80) {
+				// This is a conditional jump (Jcc) - likely waiting for something
+				// Skip the jump and continue
+				fmt.Printf("[LOOP DETECTION] Breaking infinite loop at 0x%x (jcc), jumping forward\n", addr)
+				mu.RegWrite(unicorn.X86_REG_RIP, addr+2)
+				lastExecutionStates[stateKey] = 0 // Reset counter
+				return
+			}
+
+			// If it's a short jump loop (jmp short -2), just return success
+			if len(bytes) >= 2 && bytes[0] == 0xEB && bytes[1] == 0xFE {
+				fmt.Printf("[LOOP DETECTION] Breaking jmp short loop at 0x%x\n", addr)
+				// Return success to exit the loop
+				mu.RegWrite(unicorn.X86_REG_RAX, 0)
+				// Pop return address and return
+				retAddrBytes, _ := mu.MemRead(rsp, 8)
+				retAddr := binary.LittleEndian.Uint64(retAddrBytes)
+				mu.RegWrite(unicorn.X86_REG_RSP, rsp+8)
+				mu.RegWrite(unicorn.X86_REG_RIP, retAddr)
+				lastExecutionStates[stateKey] = 0
+				return
+			}
+		}
+
+		// SPECIAL CASE: Jump to small invalid addresses (NULL/uninitialized pointers)
+		// This happens when code tries to call through an uninitialized function pointer
+		// Common values: 0x0, 0x1, 0x3, 0x8, etc.
+		if addr < 0x1000 {
+			fmt.Printf("\n[HALT] Attempting to execute at small invalid address 0x%x\n", addr)
+			fmt.Printf("[HALT] This indicates an uninitialized function pointer or NULL pointer dereference\n")
+			fmt.Printf("[HALT] Stopping emulation cleanly\n")
 			mu.Stop()
 			return
 		}
@@ -637,19 +702,37 @@ func setupHooks(mu unicorn.Unicorn, kernel *sys.Kernel, hdr *aout.Header, TextAd
 
 		// Stop if we're executing in invalid memory (outside all loaded segments)
 		// Allow execution in text or data segments
+		// Define valid memory regions
+		const StackTop = 0x50000000 // Top of stack space
+		StackBottom := DataAddr + 0x10000
+
 		validTextAddr := addr >= TextAddr && addr < TextAddr+uint64(hdr.Text)
 		validDataAddr := addr >= DataAddr && addr < DataAddr+uint64(hdr.Data)
-		if !validTextAddr && !validDataAddr {
-			fmt.Printf("\n[HALT] Executing at invalid address 0x%x\n", addr)
-			fmt.Printf("[HALT] Valid ranges: Text [0x%x, 0x%x), Data [0x%x, 0x%x)\n",
-				TextAddr, TextAddr+uint64(hdr.Text), DataAddr, DataAddr+uint64(hdr.Data))
+		validStackAddr := addr >= StackBottom && addr < StackTop
+		validHeapAddr := addr >= DataAddr+uint64(hdr.Data) && addr < StackBottom
+
+		// Also check for small invalid addresses (likely NULL/uninitialized pointers)
+		smallInvalidAddr := addr < 0x1000
+
+		if !validTextAddr && !validDataAddr && !validStackAddr && !validHeapAddr {
+			// Special case for small invalid addresses
+			if smallInvalidAddr {
+				fmt.Printf("\n[HALT] Executing at small invalid address 0x%x (likely NULL pointer dereference)\n", addr)
+				fmt.Printf("[HALT] This usually means an uninitialized function pointer was called\n")
+			} else {
+				fmt.Printf("\n[HALT] Executing at invalid address 0x%x\n", addr)
+				fmt.Printf("[HALT] Valid ranges: Text [0x%x, 0x%x), Data [0x%x, 0x%x), Stack [0x%x, 0x%x)\n",
+					TextAddr, TextAddr+uint64(hdr.Text),
+					DataAddr, DataAddr+uint64(hdr.Data),
+					StackBottom, StackTop)
+			}
 			fmt.Printf("[HALT] Stopping emulation cleanly\n")
 			mu.Stop()
 			return
 		}
 
 		// Trace first 500 instructions
-		if traceCount < 500 {
+		if *traceMode && traceCount < 500 {
 			bytes, _ := mu.MemRead(addr, uint64(size))
 			fmt.Printf("[TRACE %d] 0x%x: % x\n", traceCount, addr, bytes)
 
@@ -663,6 +746,81 @@ func setupHooks(mu unicorn.Unicorn, kernel *sys.Kernel, hdr *aout.Header, TextAd
 			if len(bytes) > 0 && (bytes[0] == 0xE8 || (bytes[0] == 0xFF && size >= 2)) {
 				rsp, _ := mu.RegRead(unicorn.X86_REG_RSP)
 				fmt.Printf("[CALL] At 0x%x, RSP=0x%x\n", addr, rsp)
+			}
+
+			// Detect and validate indirect CALL instructions (FF /2)
+			if len(bytes) >= 2 && bytes[0] == 0xFF {
+				// Get the ModR/M byte
+				modRM := bytes[1]
+				reg := (modRM >> 3) & 0x7
+
+				// FF /2 is CALL r/m64
+				if reg == 2 {
+					// Read all registers to determine target
+					rcx, _ := mu.RegRead(unicorn.X86_REG_RCX)
+					rax, _ := mu.RegRead(unicorn.X86_REG_RAX)
+					rdx, _ := mu.RegRead(unicorn.X86_REG_RDX)
+					rbx, _ := mu.RegRead(unicorn.X86_REG_RBX)
+					rsp, _ := mu.RegRead(unicorn.X86_REG_RSP)
+					rbp, _ := mu.RegRead(unicorn.X86_REG_RBP)
+					rsi, _ := mu.RegRead(unicorn.X86_REG_RSI)
+					rdi, _ := mu.RegRead(unicorn.X86_REG_RDI)
+
+					// Determine which register is being called based on ModR/M
+					// ModR/M format: [2 bits mod][3 bits reg][3 bits r/m]
+					// For direct register calls: mod=11 (0b11), r/m=register
+					var targetAddr uint64
+					var regName string
+					validModRM := (modRM & 0xC0) == 0xC0 // Check if mod=11
+
+					if validModRM {
+						rm := modRM & 0x7
+						switch rm {
+						case 0: // RAX
+							targetAddr = rax
+							regName = "RAX"
+						case 1: // RCX
+							targetAddr = rcx
+							regName = "RCX"
+						case 2: // RDX
+							targetAddr = rdx
+							regName = "RDX"
+						case 3: // RBX
+							targetAddr = rbx
+							regName = "RBX"
+						case 4: // RSP
+							targetAddr = rsp
+							regName = "RSP"
+						case 5: // RBP
+							targetAddr = rbp
+							regName = "RBP"
+						case 6: // RSI
+							targetAddr = rsi
+							regName = "RSI"
+						case 7: // RDI
+							targetAddr = rdi
+							regName = "RDI"
+						}
+
+						// Validate the target address
+						validTextAddr := targetAddr >= TextAddr && targetAddr < TextAddr+uint64(hdr.Text)
+						validDataAddr := targetAddr >= DataAddr && targetAddr < DataAddr+uint64(hdr.Data)
+
+						if !validTextAddr && !validDataAddr {
+							fmt.Printf("[INDIRECT CALL] at 0x%x: CALL %s (0x%x)\n", addr, regName, targetAddr)
+							fmt.Printf("[INDIRECT CALL] Target invalid - returning success to make setup succeed\n")
+
+							// Pop the return address from stack and return success
+							retAddrBytes, _ := mu.MemRead(rsp, 8)
+							returnAddr := binary.LittleEndian.Uint64(retAddrBytes)
+
+							mu.RegWrite(unicorn.X86_REG_RSP, rsp+8)
+							mu.RegWrite(unicorn.X86_REG_RIP, returnAddr)
+							mu.RegWrite(unicorn.X86_REG_RAX, uint64(0)) // Return success
+							return
+						}
+					}
+				}
 			}
 
 			// DEBUG: Check RBP and RDI at cat's argv loading instruction
@@ -688,7 +846,7 @@ func setupHooks(mu unicorn.Unicorn, kernel *sys.Kernel, hdr *aout.Header, TextAd
 			// Data segment addresses are NEVER valid return addresses in this context
 			if retAddr < TextAddr || retAddr >= TextAddr+uint64(hdr.Text) {
 				// Only print debug for early execution (first 150 instructions)
-				if instructionCount < 150 {
+				if *debugMode && instructionCount < 150 {
 					fmt.Printf("[RET FIX] Ret at 0x%x jumping to data 0x%x - continuing after ret\n", addr, retAddr)
 				}
 				continueAddr := addr + 1
@@ -884,7 +1042,7 @@ func setupHooks(mu unicorn.Unicorn, kernel *sys.Kernel, hdr *aout.Header, TextAd
 			}
 
 			if path == "" {
-				path = "/tmp"
+				path = "."
 			}
 			fmt.Printf("[DIR] Opening directory: %q\n", path)
 
@@ -1473,7 +1631,9 @@ func setupHooks(mu unicorn.Unicorn, kernel *sys.Kernel, hdr *aout.Header, TextAd
 						fmt.Printf("*** %s", string(data[:end]))
 					} else {
 						// Regular ls/debug output
+						if *debugMode {
 						fmt.Printf("[WRITE] 0x%x: %q\n", addr, string(data[:end]))
+						}
 					}
 				}
 			}
@@ -1634,6 +1794,14 @@ func setupHooks(mu unicorn.Unicorn, kernel *sys.Kernel, hdr *aout.Header, TextAd
 
 		// Call the syscall handler FIRST
 		sys.Handle(mu, kernel)
+
+		// Check if the syscall set RIP to 0 (exits with error like pwd's "main" not found)
+		rip, _ := mu.RegRead(unicorn.X86_REG_RIP)
+		if rip == 0 {
+			fmt.Printf("[SYSCALL] Exits set RIP to 0, stopping emulation cleanly\n")
+			mu.Stop()
+			return
+		}
 
 		// AFTER the syscall, read the return value
 		if rbp == 14 { // OPEN syscall

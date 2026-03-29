@@ -25,6 +25,20 @@ var (
 // Global variable to store the argv array address for later use
 var globalArgvArrayAddr uint64 = 0
 
+// debugPrintf prints debug output only if not in quiet mode
+func debugPrintf(format string, args ...interface{}) {
+    if !*quietMode {
+        fmt.Printf(format, args...)
+    }
+}
+
+// debugLogPrintf prints debug log messages only if not in quiet mode
+func debugLogPrintf(format string, args ...interface{}) {
+    if !*quietMode {
+        debugLogPrintf(format, args...)
+    }
+}
+
 func main() {
 	flag.Parse()
 	args := flag.Args()
@@ -89,30 +103,30 @@ func main() {
 		symTableOffset := int64(32 + hdr.Text + hdr.Data)
 		if _, err := f.Seek(symTableOffset, 0); err != nil {
 			if !*quietMode {
-				log.Printf("Warning: Could not seek to symbol table: %v", err)
+				debugLogPrintf("Warning: Could not seek to symbol table: %v", err)
 			}
 		} else {
 			symbols, err := aout.ReadSymbolTable(f, hdr.Syms)
 			if err != nil {
 				if !*quietMode {
-					log.Printf("Warning: Could not read symbol table: %v", err)
+					debugLogPrintf("Warning: Could not read symbol table: %v", err)
 				}
 			} else {
 				if *verboseMode {
-					fmt.Printf("[symbols] Read %d symbols\n", len(symbols))
+					debugPrintf("[symbols] Read %d symbols\n", len(symbols))
 				}
 				mainAddr = aout.FindMainSymbol(symbols, args[0])
 				if *verboseMode && mainAddr != 0 {
-					fmt.Printf("[symbols] Found entry function at 0x%x\n", mainAddr)
+					debugPrintf("[symbols] Found entry function at 0x%x\n", mainAddr)
 				} else if *verboseMode {
-					fmt.Printf("[symbols] Entry function not found, will use entry point\n")
+					debugPrintf("[symbols] Entry function not found, will use entry point\n")
 					mainAddr = entryPoint
 				}
 			}
 		}
 	} else {
 		if *verboseMode {
-			fmt.Printf("[symbols] No symbol table in binary\n")
+			debugPrintf("[symbols] No symbol table in binary\n")
 		}
 		mainAddr = entryPoint
 	}
@@ -152,7 +166,7 @@ func main() {
 
 	// Map a zero page at address 0 to catch NULL pointer accesses gracefully
 	if err := mu.MemMap(0, 0x1000); err != nil {
-		log.Printf("Warning: Could not map zero page: %v", err)
+		debugLogPrintf("Warning: Could not map zero page: %v", err)
 	} else {
 		// Fill with zeros
 		zeroPage := make([]byte, 0x1000)
@@ -171,7 +185,7 @@ func main() {
 	// This is where ls tries to format output strings
 	lsBufSize := uint64(1024 * 1024) // 1 MB
 	if err := mu.MemMap(DataAddr+0x100000, lsBufSize); err != nil {
-		log.Printf("Warning: Could not map ls buffer space: %v", err)
+		debugLogPrintf("Warning: Could not map ls buffer space: %v", err)
 	}
 
 	// Write segments
@@ -219,12 +233,12 @@ func main() {
 			mu.MemWrite(DataAddr+offset, newBytes)
 			patchCount++
 			if *debugMode && patchCount <= 15 {
-				fmt.Printf("[PATCH] Fixed offset at 0x%x: 0x%x -> 0x%x\n", DataAddr+offset, value, newValue)
+				debugPrintf("[PATCH] Fixed offset at 0x%x: 0x%x -> 0x%x\n", DataAddr+offset, value, newValue)
 			}
 		}
 	}
 	if *debugMode {
-		fmt.Printf("[PATCH] Fixed %d data pointers\n", patchCount)
+		debugPrintf("[PATCH] Fixed %d data pointers\n", patchCount)
 	}
 
 	// Zero-fill BSS
@@ -234,7 +248,7 @@ func main() {
 	if bssEnd > bssAddr {
 		bssZero := make([]byte, bssEnd-bssAddr)
 		if err := mu.MemWrite(bssAddr, bssZero); err != nil {
-			log.Printf("Warning: Could not zero Bss: %v", err)
+			debugLogPrintf("Warning: Could not zero Bss: %v", err)
 		}
 	}
 
@@ -260,6 +274,7 @@ func main() {
 
 	// Initialize kernel
 	kernel := sys.NewKernel()
+	kernel.SetQuiet(*quietMode)
 	kernel.SetPrivatesAddress(privatesAddr)
 	kernel.SetNprivatesAddress(nprivatesAddr)
 	kernel.SetEndAddress(endAddr)
@@ -268,7 +283,7 @@ func main() {
 
 	// Initialize time structure (required by date and other time-using programs)
 	if err := kernel.InitTimeStructures(mu, DataAddr); err != nil {
-		log.Printf("Warning: Could not initialize time structure: %v", err)
+		debugLogPrintf("Warning: Could not initialize time structure: %v", err)
 	}
 
 	// Initialize _tos structure
@@ -283,7 +298,7 @@ func main() {
 
 	// Set up argv for Plan 9 binary
 	// Skip os.Args[0] (./9xe) and use binary name as argv[0]
-	plan9Args := os.Args[1:] // Skip "./9xe"
+	plan9Args := args // Use parsed args (flags already removed by flag.Parse())
 	if len(plan9Args) == 0 {
 		// No binary specified, nothing to do
 		return
@@ -316,7 +331,7 @@ func main() {
 		stackPtr &= ^uint64(7)
 		mu.MemWrite(stackPtr, argBytes)
 		argvAddrs = append(argvAddrs, stackPtr)
-		fmt.Printf("[argv] argv[%d] = 0x%x -> %q\n", i, stackPtr, arg)
+		debugPrintf("[argv] argv[%d] = 0x%x -> %q\n", i, stackPtr, arg)
 	}
 
 	// Reserve extra space to avoid being overwritten by initialization code
@@ -332,7 +347,7 @@ func main() {
 	argcBytes := make([]byte, 8)
 	binary.LittleEndian.PutUint64(argcBytes, uint64(len(plan9Argv)))
 	mu.MemWrite(argcAddr, argcBytes)
-	fmt.Printf("[SETUP] Placed argc=%d at 0x%x\n", len(plan9Argv), argcAddr)
+	debugPrintf("[SETUP] Placed argc=%d at 0x%x\n", len(plan9Argv), argcAddr)
 
 	argvArrayAddr := stackPtr - uint64((len(plan9Argv)+1)*8)
 	argvArrayAddr &= ^uint64(7)
@@ -341,26 +356,26 @@ func main() {
 		addrBytes := make([]byte, 8)
 		binary.LittleEndian.PutUint64(addrBytes, addr)
 		mu.MemWrite(argvArrayAddr+uint64(i*8), addrBytes)
-		fmt.Printf("[argv] argvArray[%d] = 0x%x (pointer to argv[%d])\n", i, argvArrayAddr+uint64(i*8), i)
+		debugPrintf("[argv] argvArray[%d] = 0x%x (pointer to argv[%d])\n", i, argvArrayAddr+uint64(i*8), i)
 	}
 
 	nullTerm := make([]byte, 8)
 	mu.MemWrite(argvArrayAddr+uint64(len(plan9Argv)*8), nullTerm)
-	fmt.Printf("[SETUP] Wrote null terminator at 0x%x\n", argvArrayAddr+uint64(len(plan9Argv)*8))
+	debugPrintf("[SETUP] Wrote null terminator at 0x%x\n", argvArrayAddr+uint64(len(plan9Argv)*8))
 
 	// Debug: log what's in argv array
-	fmt.Printf("[argv] argvArray at 0x%x:\n", argvArrayAddr)
+	debugPrintf("[argv] argvArray at 0x%x:\n", argvArrayAddr)
 	for i := 0; i < len(argvAddrs); i++ {
 		ptrBytes, _ := mu.MemRead(argvArrayAddr+uint64(i*8), 8)
 		ptr := binary.LittleEndian.Uint64(ptrBytes)
-		fmt.Printf("[argv]   [%d] = 0x%x\n", i, ptr)
+		debugPrintf("[argv]   [%d] = 0x%x\n", i, ptr)
 	}
 
 	kernel.SetTosAddress(tosAddr)
 
 	// Store argv array address globally for later use (e.g., directory reading)
 	globalArgvArrayAddr = argvArrayAddr
-	fmt.Printf("[GLOBAL] Stored argv array address: 0x%x\n", globalArgvArrayAddr)
+	debugPrintf("[GLOBAL] Stored argv array address: 0x%x\n", globalArgvArrayAddr)
 
 	// Set up stack
 	// We need to leave space for main's stack frame, so adjust finalRSP
@@ -374,7 +389,7 @@ func main() {
 	catArgIndexBytes := make([]byte, 8)
 	binary.LittleEndian.PutUint64(catArgIndexBytes, 1)
 	mu.MemWrite(catArgIndexAddr, catArgIndexBytes)
-	fmt.Printf("[PATCH] Set cat argument index to 1 at [RSP+0xb0] = 0x%x\n", catArgIndexAddr)
+	debugPrintf("[PATCH] Set cat argument index to 1 at [RSP+0xb0] = 0x%x\n", catArgIndexAddr)
 
 	// Calculate where main expects to find argv pointer
 	// Cat's entry point allocates stack space, so we need to account for that
@@ -385,16 +400,16 @@ func main() {
 	argvPtrBytes := make([]byte, 8)
 	binary.LittleEndian.PutUint64(argvPtrBytes, argvArrayAddr)
 	mu.MemWrite(mainArgvPtrAddr, argvPtrBytes)
-	fmt.Printf("[SETUP] Placed argv pointer (0x%x) at finalRSP+0x18 = 0x%x\n", argvArrayAddr, mainArgvPtrAddr)
-	fmt.Printf("[SETUP] When main runs, RSP will be finalRSP-0x20=0x%x, so [RSP+0x38]=[0x%x]\n", finalRSP-0x20, mainArgvPtrAddr)
+	debugPrintf("[SETUP] Placed argv pointer (0x%x) at finalRSP+0x18 = 0x%x\n", argvArrayAddr, mainArgvPtrAddr)
+	debugPrintf("[SETUP] When main runs, RSP will be finalRSP-0x20=0x%x, so [RSP+0x38]=[0x%x]\n", finalRSP-0x20, mainArgvPtrAddr)
 
 	// Verify the write
 	checkBytes, _ := mu.MemRead(mainArgvPtrAddr, 8)
 	checkPtr := binary.LittleEndian.Uint64(checkBytes)
-	fmt.Printf("[SETUP] Verification: Read back 0x%x from [0x%x]\n", checkPtr, mainArgvPtrAddr)
+	debugPrintf("[SETUP] Verification: Read back 0x%x from [0x%x]\n", checkPtr, mainArgvPtrAddr)
 
 	// Debug: Dump memory around argument strings
-	fmt.Printf("[DEBUG] Memory dump around argv[2] (0x41fff88):\n")
+	debugPrintf("[DEBUG] Memory dump around argv[2] (0x41fff88):\n")
 	dumpBytes, _ := mu.MemRead(0x41fff80, 64)
 	for i := 0; i < 8; i++ {
 		offset := 0x41fff80 + uint64(i*8)
@@ -405,16 +420,16 @@ func main() {
 			end--
 		}
 		str := string(dumpBytes[i*8 : i*8+end])
-		fmt.Printf("[DEBUG] [0x%x] = 0x%x (% x) \"%s\"\n", offset, data, dumpBytes[i*8:i*8+8], str)
+		debugPrintf("[DEBUG] [0x%x] = 0x%x (% x) \"%s\"\n", offset, data, dumpBytes[i*8:i*8+8], str)
 	}
 
 	// Also dump the argv array itself
-	fmt.Printf("[DEBUG] argv array contents:\n")
+	debugPrintf("[DEBUG] argv array contents:\n")
 	for i := 0; i < 3; i++ {
 		addr := argvArrayAddr + uint64(i*8)
 		ptrBytes, _ := mu.MemRead(addr, 8)
 		ptr := binary.LittleEndian.Uint64(ptrBytes)
-		fmt.Printf("[DEBUG] argv[%d] at [0x%x] = 0x%x\n", i, addr, ptr)
+		debugPrintf("[DEBUG] argv[%d] at [0x%x] = 0x%x\n", i, addr, ptr)
 	}
 
 	mu.RegWrite(unicorn.X86_REG_RSP, finalRSP)
@@ -457,12 +472,12 @@ func main() {
 	rdx, _ := mu.RegRead(unicorn.X86_REG_RDX)
 
 	fmt.Printf("\n[Final] RIP=%x RSP=%x\n", rip, rsp)
-	fmt.Printf("[Final] RAX=%x RBX=%x RCX=%x RDX=%x\n", rax, rbx, rcx, rdx)
+	debugPrintf("[Final] RAX=%x RBX=%x RCX=%x RDX=%x\n", rax, rbx, rcx, rdx)
 
 	// Get final counts from hooks
 	finalInstrCount := instructionCount
 	finalSyscallCount := syscallCount
-	fmt.Printf("[Summary] Executed %d instructions, %d syscalls\n", finalInstrCount, finalSyscallCount)
+	debugPrintf("[Summary] Executed %d instructions, %d syscalls\n", finalInstrCount, finalSyscallCount)
 }
 
 func setupHooks(mu unicorn.Unicorn, kernel *sys.Kernel, hdr *aout.Header, TextAddr, DataAddr, BaseAddr uint64, MemSize, ExtraMemSize int, entryPoint, mainAddr, tosAddr, argvArrayAddr uint64, plan9Argv []string) (int, int) {
@@ -488,14 +503,14 @@ func setupHooks(mu unicorn.Unicorn, kernel *sys.Kernel, hdr *aout.Header, TextAd
 
 		// If we've seen this (RIP, RSP) pair too many times, we're in a loop
 		if lastExecutionStates[stateKey] > maxLoopIterations && instructionCount > 1000 {
-			fmt.Printf("[LOOP DETECTION] Possible infinite loop at 0x%x (RSP=0x%x), seen %d times\n", addr, rsp, lastExecutionStates[stateKey])
+			debugPrintf("[LOOP DETECTION] Possible infinite loop at 0x%x (RSP=0x%x), seen %d times\n", addr, rsp, lastExecutionStates[stateKey])
 
 			// Check if this is a conditional jump loop
 			bytes, _ := mu.MemRead(addr, 2)
 			if len(bytes) >= 2 && bytes[0] == 0x0F && (bytes[1]&0xF0 == 0x80) {
 				// This is a conditional jump (Jcc) - likely waiting for something
 				// Skip the jump and continue
-				fmt.Printf("[LOOP DETECTION] Breaking infinite loop at 0x%x (jcc), jumping forward\n", addr)
+				debugPrintf("[LOOP DETECTION] Breaking infinite loop at 0x%x (jcc), jumping forward\n", addr)
 				mu.RegWrite(unicorn.X86_REG_RIP, addr+2)
 				lastExecutionStates[stateKey] = 0 // Reset counter
 				return
@@ -503,7 +518,7 @@ func setupHooks(mu unicorn.Unicorn, kernel *sys.Kernel, hdr *aout.Header, TextAd
 
 			// If it's a short jump loop (jmp short -2), just return success
 			if len(bytes) >= 2 && bytes[0] == 0xEB && bytes[1] == 0xFE {
-				fmt.Printf("[LOOP DETECTION] Breaking jmp short loop at 0x%x\n", addr)
+				debugPrintf("[LOOP DETECTION] Breaking jmp short loop at 0x%x\n", addr)
 				// Return success to exit the loop
 				mu.RegWrite(unicorn.X86_REG_RAX, 0)
 				// Pop return address and return
@@ -521,8 +536,8 @@ func setupHooks(mu unicorn.Unicorn, kernel *sys.Kernel, hdr *aout.Header, TextAd
 		// Common values: 0x0, 0x1, 0x3, 0x8, etc.
 		if addr < 0x1000 {
 			fmt.Printf("\n[HALT] Attempting to execute at small invalid address 0x%x\n", addr)
-			fmt.Printf("[HALT] This indicates an uninitialized function pointer or NULL pointer dereference\n")
-			fmt.Printf("[HALT] Stopping emulation cleanly\n")
+			debugPrintf("[HALT] This indicates an uninitialized function pointer or NULL pointer dereference\n")
+			debugPrintf("[HALT] Stopping emulation cleanly\n")
 			mu.Stop()
 			return
 		}
@@ -532,8 +547,8 @@ func setupHooks(mu unicorn.Unicorn, kernel *sys.Kernel, hdr *aout.Header, TextAd
 		// mkdir has a different entry function at 0x2001a8 that returns to 0x2001f5
 		if addr == 0x2002f4 || addr == 0x2001f5 {
 			fmt.Printf("\n[SUCCESS] Entry function returning at 0x%x\n", addr)
-			fmt.Printf("[SUCCESS] Program execution completed\n")
-			fmt.Printf("[SUCCESS] Stopping emulation cleanly\n")
+			debugPrintf("[SUCCESS] Program execution completed\n")
+			debugPrintf("[SUCCESS] Stopping emulation cleanly\n")
 			mu.Stop()
 			return
 		}
@@ -542,7 +557,7 @@ func setupHooks(mu unicorn.Unicorn, kernel *sys.Kernel, hdr *aout.Header, TextAd
 		// sysfatal is called by init functions when checks fail
 		// We want to ignore these failures and continue execution
 		if addr == 0x204191 {
-			fmt.Printf("[STUB] sysfatal called - stubbing to return without action\n")
+			debugPrintf("[STUB] sysfatal called - stubbing to return without action\n")
 			// Pop return address from stack and return there
 			rsp, _ := mu.RegRead(unicorn.X86_REG_RSP)
 			retAddrBytes, _ := mu.MemRead(rsp, 8)
@@ -566,7 +581,7 @@ func setupHooks(mu unicorn.Unicorn, kernel *sys.Kernel, hdr *aout.Header, TextAd
 
 			// If return address is in text segment, this is a recursive call
 			if retAddr >= TextAddr && retAddr < TextAddr+uint64(hdr.Text) {
-				fmt.Printf("[STUB] Recursive display update call at 0x%x - stubbing to return\n", addr)
+				debugPrintf("[STUB] Recursive display update call at 0x%x - stubbing to return\n", addr)
 				mu.RegWrite(unicorn.X86_REG_RSP, rsp+8)
 				mu.RegWrite(unicorn.X86_REG_RIP, retAddr)
 				mu.RegWrite(unicorn.X86_REG_RAX, 0) // Return success
@@ -587,7 +602,7 @@ func setupHooks(mu unicorn.Unicorn, kernel *sys.Kernel, hdr *aout.Header, TextAd
 				// Use instruction count as a rough proxy for iterations
 				if instructionCount > 200000 {
 					fmt.Printf("\n[SUCCESS] Cat has been running for a while - stopping\n")
-					fmt.Printf("[SUCCESS] Processed %d instructions\n", instructionCount)
+					debugPrintf("[SUCCESS] Processed %d instructions\n", instructionCount)
 					mu.Stop()
 					return
 				}
@@ -603,7 +618,7 @@ func setupHooks(mu unicorn.Unicorn, kernel *sys.Kernel, hdr *aout.Header, TextAd
 				mu.RegWrite(unicorn.X86_REG_RDX, 10) // RDX = 10 > RCX = 1, so jge won't jump
 				mainCodeAddr := uint64(0x2000db)
 				mu.RegWrite(unicorn.X86_REG_RIP, mainCodeAddr)
-				fmt.Printf("[STUB] Set RDX=10 to bypass loop, jumping to 0x%x (actual main code)\n", mainCodeAddr)
+				debugPrintf("[STUB] Set RDX=10 to bypass loop, jumping to 0x%x (actual main code)\n", mainCodeAddr)
 				return
 			}
 
@@ -619,8 +634,8 @@ func setupHooks(mu unicorn.Unicorn, kernel *sys.Kernel, hdr *aout.Header, TextAd
 			// SPECIAL CASE 3: I/O completion at 0x20011c - program is done
 			if addr == 0x20011c {
 				fmt.Printf("\n[SUCCESS] Program completed I/O and reached exit point at 0x%x\n", addr)
-				fmt.Printf("[SUCCESS] All file operations completed successfully!\n")
-				fmt.Printf("[SUCCESS] Stopping emulation cleanly\n")
+				debugPrintf("[SUCCESS] All file operations completed successfully!\n")
+				debugPrintf("[SUCCESS] Stopping emulation cleanly\n")
 				mu.Stop()
 				return
 			}
@@ -638,7 +653,7 @@ func setupHooks(mu unicorn.Unicorn, kernel *sys.Kernel, hdr *aout.Header, TextAd
 				// Note: Setup functions typically allocate stack space, so return address
 				// might be at [RSP+0x10] instead of [RSP]
 				rsp, _ := mu.RegRead(unicorn.X86_REG_RSP)
-				fmt.Printf("[STUB] RSP = 0x%x\n", rsp)
+				debugPrintf("[STUB] RSP = 0x%x\n", rsp)
 
 				// Try to find the return address by checking multiple stack locations
 				// Only accept addresses in text segment (data addresses are not valid return addresses)
@@ -658,7 +673,7 @@ func setupHooks(mu unicorn.Unicorn, kernel *sys.Kernel, hdr *aout.Header, TextAd
 						retAddr = potentialAddr
 						found = true
 						foundOffset = offset
-						fmt.Printf("[STUB] Found return address 0x%x at [RSP+0x%x]\n", retAddr, offset)
+						debugPrintf("[STUB] Found return address 0x%x at [RSP+0x%x]\n", retAddr, offset)
 						break
 					}
 				}
@@ -670,13 +685,13 @@ func setupHooks(mu unicorn.Unicorn, kernel *sys.Kernel, hdr *aout.Header, TextAd
 						// This loop is followed by code that returns to invalid data
 						// Skip directly to the entry function instead
 						entryFunc := uint64(0x2002d2)
-						fmt.Printf("[STUB] Setup loop at 0x%x - jumping to entry function 0x%x\n", addr, entryFunc)
+						debugPrintf("[STUB] Setup loop at 0x%x - jumping to entry function 0x%x\n", addr, entryFunc)
 						mu.RegWrite(unicorn.X86_REG_RIP, entryFunc)
 						return
 					} else {
 						// Generic case: skip past the loop
 						retAddr := addr + 2
-						fmt.Printf("[STUB] No return address on stack - skipping past loop to 0x%x\n", retAddr)
+						debugPrintf("[STUB] No return address on stack - skipping past loop to 0x%x\n", retAddr)
 						mu.RegWrite(unicorn.X86_REG_RIP, retAddr)
 						mu.RegWrite(unicorn.X86_REG_RAX, 0) // Return success
 						return
@@ -688,7 +703,7 @@ func setupHooks(mu unicorn.Unicorn, kernel *sys.Kernel, hdr *aout.Header, TextAd
 					mu.RegWrite(unicorn.X86_REG_RSP, rsp+foundOffset+8)
 					mu.RegWrite(unicorn.X86_REG_RIP, retAddr)
 					mu.RegWrite(unicorn.X86_REG_RAX, 0) // Return success
-					fmt.Printf("[STUB] Set RIP=0x%x, RSP=0x%x, RAX=0 - returning from stub\n", retAddr, rsp+foundOffset+8)
+					debugPrintf("[STUB] Set RIP=0x%x, RSP=0x%x, RAX=0 - returning from stub\n", retAddr, rsp+foundOffset+8)
 					return
 				}
 			}
@@ -718,15 +733,15 @@ func setupHooks(mu unicorn.Unicorn, kernel *sys.Kernel, hdr *aout.Header, TextAd
 			// Special case for small invalid addresses
 			if smallInvalidAddr {
 				fmt.Printf("\n[HALT] Executing at small invalid address 0x%x (likely NULL pointer dereference)\n", addr)
-				fmt.Printf("[HALT] This usually means an uninitialized function pointer was called\n")
+				debugPrintf("[HALT] This usually means an uninitialized function pointer was called\n")
 			} else {
 				fmt.Printf("\n[HALT] Executing at invalid address 0x%x\n", addr)
-				fmt.Printf("[HALT] Valid ranges: Text [0x%x, 0x%x), Data [0x%x, 0x%x), Stack [0x%x, 0x%x)\n",
+				debugPrintf("[HALT] Valid ranges: Text [0x%x, 0x%x), Data [0x%x, 0x%x), Stack [0x%x, 0x%x)\n",
 					TextAddr, TextAddr+uint64(hdr.Text),
 					DataAddr, DataAddr+uint64(hdr.Data),
 					StackBottom, StackTop)
 			}
-			fmt.Printf("[HALT] Stopping emulation cleanly\n")
+			debugPrintf("[HALT] Stopping emulation cleanly\n")
 			mu.Stop()
 			return
 		}
@@ -745,7 +760,7 @@ func setupHooks(mu unicorn.Unicorn, kernel *sys.Kernel, hdr *aout.Header, TextAd
 			// Detect CALL instructions (E8 = relative CALL, FF /2 = indirect CALL)
 			if len(bytes) > 0 && (bytes[0] == 0xE8 || (bytes[0] == 0xFF && size >= 2)) {
 				rsp, _ := mu.RegRead(unicorn.X86_REG_RSP)
-				fmt.Printf("[CALL] At 0x%x, RSP=0x%x\n", addr, rsp)
+				debugPrintf("[CALL] At 0x%x, RSP=0x%x\n", addr, rsp)
 			}
 
 			// Detect and validate indirect CALL instructions (FF /2)
@@ -807,8 +822,8 @@ func setupHooks(mu unicorn.Unicorn, kernel *sys.Kernel, hdr *aout.Header, TextAd
 						validDataAddr := targetAddr >= DataAddr && targetAddr < DataAddr+uint64(hdr.Data)
 
 						if !validTextAddr && !validDataAddr {
-							fmt.Printf("[INDIRECT CALL] at 0x%x: CALL %s (0x%x)\n", addr, regName, targetAddr)
-							fmt.Printf("[INDIRECT CALL] Target invalid - returning success to make setup succeed\n")
+							debugPrintf("[INDIRECT CALL] at 0x%x: CALL %s (0x%x)\n", addr, regName, targetAddr)
+							debugPrintf("[INDIRECT CALL] Target invalid - returning success to make setup succeed\n")
 
 							// Pop the return address from stack and return success
 							retAddrBytes, _ := mu.MemRead(rsp, 8)
@@ -828,7 +843,7 @@ func setupHooks(mu unicorn.Unicorn, kernel *sys.Kernel, hdr *aout.Header, TextAd
 				rbp, _ := mu.RegRead(unicorn.X86_REG_RBP)
 				rdi, _ := mu.RegRead(unicorn.X86_REG_RDI)
 				rsp, _ := mu.RegRead(unicorn.X86_REG_RSP)
-				fmt.Printf("[DEBUG] At 0x%x: RBP=%d RDI=0x%x RSP=0x%x\n", addr, rbp, rdi, rsp)
+				debugPrintf("[DEBUG] At 0x%x: RBP=%d RDI=0x%x RSP=0x%x\n", addr, rbp, rdi, rsp)
 			}
 
 			traceCount++
@@ -913,38 +928,38 @@ func setupHooks(mu unicorn.Unicorn, kernel *sys.Kernel, hdr *aout.Header, TextAd
 			// This is a conditional jump - check if it's taken
 			// 0f 84 3b 01 00 00 = je rel32 (jump if equal)
 			// If taken, we skip some code. If not taken, we continue to main logic.
-			fmt.Printf("[DEBUG] At 0x20cedf: conditional jump (je) - checking flags\n")
+			debugPrintf("[DEBUG] At 0x20cedf: conditional jump (je) - checking flags\n")
 		}
 
 		// DEBUG: Check eax at the comparison that might skip main logic
 		if addr == 0x20b395 {
 			rax, _ := mu.RegRead(unicorn.X86_REG_RAX)
-			fmt.Printf("[DEBUG] At 0x20b395: cmp eax, 0 - eax = %d (will skip main logic if <= 0)\n", rax)
+			debugPrintf("[DEBUG] At 0x20b395: cmp eax, 0 - eax = %d (will skip main logic if <= 0)\n", rax)
 		}
 
 		// DEBUG: Check return value from function call
 		if addr == 0x20b393 {
 			rax, _ := mu.RegRead(unicorn.X86_REG_RAX)
-			fmt.Printf("[DEBUG] At 0x20b393: mov ecx, eax - eax=%d, will move to ecx\n", rax)
+			debugPrintf("[DEBUG] At 0x20b393: mov ecx, eax - eax=%d, will move to ecx\n", rax)
 		}
 
 		// DEBUG: Check after function returns
 		if addr == 0x20b369 {
 			rax, _ := mu.RegRead(unicorn.X86_REG_RAX)
-			fmt.Printf("[DEBUG] After call to 0x20c0b6, eax = %d\n", rax)
+			debugPrintf("[DEBUG] After call to 0x20c0b6, eax = %d\n", rax)
 			if rax == 0 {
 				// Override eax to 1 if it's still 0
-				fmt.Printf("[DEBUG] Overriding eax from 0 to 1\n")
+				debugPrintf("[DEBUG] Overriding eax from 0 to 1\n")
 				mu.RegWrite(unicorn.X86_REG_RAX, uint64(1))
 			}
 			// Check what's in the data structure at [RSP+0x1a0]
 			rsp, _ := mu.RegRead(unicorn.X86_REG_RSP)
 			targetAddr := rsp + 0x1a0
-			fmt.Printf("[DEBUG] Data structure at [RSP+0x1a0] = 0x%x\n", targetAddr)
+			debugPrintf("[DEBUG] Data structure at [RSP+0x1a0] = 0x%x\n", targetAddr)
 
 			// Read the structure directly from [RSP+0x1a0]
 			structBytes, _ := mu.MemRead(targetAddr, 40)
-			fmt.Printf("[DEBUG] Structure at target: % x\n", structBytes)
+			debugPrintf("[DEBUG] Structure at target: % x\n", structBytes)
 
 			// Parse individual fields
 			field1 := binary.LittleEndian.Uint64(structBytes[0:8])
@@ -953,16 +968,16 @@ func setupHooks(mu unicorn.Unicorn, kernel *sys.Kernel, hdr *aout.Header, TextAd
 			field4 := binary.LittleEndian.Uint64(structBytes[24:32])
 			field5 := binary.LittleEndian.Uint64(structBytes[32:40])
 
-			fmt.Printf("[DEBUG] [+0x00] = 0x%x\n", field1)
-			fmt.Printf("[DEBUG] [+0x08] = 0x%x\n", field2)
-			fmt.Printf("[DEBUG] [+0x10] = 0x%x\n", field3)
-			fmt.Printf("[DEBUG] [+0x18] = 0x%x\n", field4)
-			fmt.Printf("[DEBUG] [+0x20] = 0x%x (should be 0x20b2fe)\n", field5)
+			debugPrintf("[DEBUG] [+0x00] = 0x%x\n", field1)
+			debugPrintf("[DEBUG] [+0x08] = 0x%x\n", field2)
+			debugPrintf("[DEBUG] [+0x10] = 0x%x\n", field3)
+			debugPrintf("[DEBUG] [+0x18] = 0x%x\n", field4)
+			debugPrintf("[DEBUG] [+0x20] = 0x%x (should be 0x20b2fe)\n", field5)
 		}
 
 		// DEBUG: Trace function 0x20c0b6 to see what it's doing
 		if addr == 0x20c0b6 {
-			fmt.Printf("[DEBUG] Entering function 0x20c0b6\n")
+			debugPrintf("[DEBUG] Entering function 0x20c0b6\n")
 			// Log arguments from stack
 			rsp, _ := mu.RegRead(unicorn.X86_REG_RSP)
 			arg1Bytes, _ := mu.MemRead(rsp+0x18, 8)
@@ -971,48 +986,48 @@ func setupHooks(mu unicorn.Unicorn, kernel *sys.Kernel, hdr *aout.Header, TextAd
 			arg2 := binary.LittleEndian.Uint32(arg2Bytes)
 			arg3Bytes, _ := mu.MemRead(rsp+0x10, 8)
 			arg3 := binary.LittleEndian.Uint64(arg3Bytes)
-			fmt.Printf("[DEBUG] Function 0x20c0b6 args: [rsp+0x18]=0x%x, [rsp+0x20]=%d, [rsp+0x10]=%d\n", arg1, arg2, arg3)
+			debugPrintf("[DEBUG] Function 0x20c0b6 args: [rsp+0x18]=0x%x, [rsp+0x20]=%d, [rsp+0x10]=%d\n", arg1, arg2, arg3)
 		}
 		if addr == 0x20c0bb {
 			// After setting byte at [rbp+0x00] to 0
-			fmt.Printf("[DEBUG] Function 0x20c0b6: Setting [RBP+0x00] to 0\n")
+			debugPrintf("[DEBUG] Function 0x20c0b6: Setting [RBP+0x00] to 0\n")
 		}
 		if addr == 0x20c0bf {
 			// Writing [rbp+0x08] = rdx
 			rdx, _ := mu.RegRead(unicorn.X86_REG_RDX)
-			fmt.Printf("[DEBUG] Function 0x20c0b6: Setting [RBP+0x08] = RDX (0x%x)\n", rdx)
+			debugPrintf("[DEBUG] Function 0x20c0b6: Setting [RBP+0x08] = RDX (0x%x)\n", rdx)
 		}
 		if addr == 0x20c0c3 {
 			// Writing [rbp+0x10] = rdx
 			rdx, _ := mu.RegRead(unicorn.X86_REG_RDX)
-			fmt.Printf("[DEBUG] Function 0x20c0b6: Setting [RBP+0x10] = RDX (0x%x)\n", rdx)
+			debugPrintf("[DEBUG] Function 0x20c0b6: Setting [RBP+0x10] = RDX (0x%x)\n", rdx)
 		}
 		if addr == 0x20c0d2 {
 			// Writing [rbp+0x18] = rsi
 			rsi, _ := mu.RegRead(unicorn.X86_REG_RSI)
-			fmt.Printf("[DEBUG] Function 0x20c0b6: Setting [RBP+0x18] = RSI (0x%x)\n", rsi)
+			debugPrintf("[DEBUG] Function 0x20c0b6: Setting [RBP+0x18] = RSI (0x%x)\n", rsi)
 		}
 		if addr == 0x20c0db {
 			// Writing [rbp+0x20] = rsi (function pointer)
 			rsi, _ := mu.RegRead(unicorn.X86_REG_RSI)
-			fmt.Printf("[DEBUG] Function 0x20c0b6: Setting [RBP+0x20] = RSI (0x%x, should be 0x20b2fe)\n", rsi)
+			debugPrintf("[DEBUG] Function 0x20c0b6: Setting [RBP+0x20] = RSI (0x%x, should be 0x20b2fe)\n", rsi)
 		}
 		if addr == 0x20c0e6 {
 			// Writing [rbp+0x28] = rsi
 			rsi, _ := mu.RegRead(unicorn.X86_REG_RSI)
-			fmt.Printf("[DEBUG] Function 0x20c0b6: Setting [RBP+0x28] = RSI (0x%x)\n", rsi)
+			debugPrintf("[DEBUG] Function 0x20c0b6: Setting [RBP+0x28] = RSI (0x%x)\n", rsi)
 		}
 		if addr == 0x20c0d6 {
 			// Loading address 0x20b2fe into ESI
-			fmt.Printf("[DEBUG] Function 0x20c0b6: Loading function pointer 0x20b2fe into struct\n")
+			debugPrintf("[DEBUG] Function 0x20c0b6: Loading function pointer 0x20b2fe into struct\n")
 			// Check what's at 0x20b2fe
 			bytes, _ := mu.MemRead(0x20b2fe, 16)
-			fmt.Printf("[DEBUG] Instructions at 0x20b2fe: % x\n", bytes)
+			debugPrintf("[DEBUG] Instructions at 0x20b2fe: % x\n", bytes)
 		}
 
 		// Check if the function pointer 0x20b2fe is ever called
 		if addr == 0x20b2fe {
-			fmt.Printf("[CALL] Function pointer 0x20b2fe called - implementing Plan 9 directory reading\n")
+			debugPrintf("[CALL] Function pointer 0x20b2fe called - implementing Plan 9 directory reading\n")
 
 			// FULL IMPLEMENTATION using Plan 9 syscalls
 			// Get the path from argv[1] (the directory argument)
@@ -1020,12 +1035,12 @@ func setupHooks(mu unicorn.Unicorn, kernel *sys.Kernel, hdr *aout.Header, TextAd
 
 			// Use the global argv array address stored during initialization
 			argvArray := globalArgvArrayAddr
-			fmt.Printf("[DIR] Using global argvArray = 0x%x\n", argvArray)
+			debugPrintf("[DIR] Using global argvArray = 0x%x\n", argvArray)
 
 			// Read argv[1] (the directory path)
 			argv1PtrBytes, _ := mu.MemRead(argvArray+8, 8)
 			argv1Ptr := binary.LittleEndian.Uint64(argv1PtrBytes)
-			fmt.Printf("[DIR] argv[1] pointer = 0x%x\n", argv1Ptr)
+			debugPrintf("[DIR] argv[1] pointer = 0x%x\n", argv1Ptr)
 
 			// Read the path string
 			var path string
@@ -1044,7 +1059,7 @@ func setupHooks(mu unicorn.Unicorn, kernel *sys.Kernel, hdr *aout.Header, TextAd
 			if path == "" {
 				path = "."
 			}
-			fmt.Printf("[DIR] Opening directory: %q\n", path)
+			debugPrintf("[DIR] Opening directory: %q\n", path)
 
 			// Write the path string to emulated memory for the OPEN syscall
 			// Use a location in the data segment
@@ -1060,7 +1075,7 @@ func setupHooks(mu unicorn.Unicorn, kernel *sys.Kernel, hdr *aout.Header, TextAd
 			// Call OPEN syscall with the path address in emulated memory
 			fd := kernel.Open(mu, pathMemAddr, openMode)
 			if fd < 0 {
-				fmt.Printf("[DIR] Failed to open directory: fd=%d\n", fd)
+				debugPrintf("[DIR] Failed to open directory: fd=%d\n", fd)
 				mu.RegWrite(unicorn.X86_REG_RAX, uint64(0))
 				// Return
 				retAddrBytes, _ := mu.MemRead(rsp, 8)
@@ -1069,7 +1084,7 @@ func setupHooks(mu unicorn.Unicorn, kernel *sys.Kernel, hdr *aout.Header, TextAd
 				mu.RegWrite(unicorn.X86_REG_RIP, retAddr)
 				return
 			}
-			fmt.Printf("[DIR] Opened directory with fd=%d\n", fd)
+			debugPrintf("[DIR] Opened directory with fd=%d\n", fd)
 
 			// Read directory entries using READ syscall (15)
 			// Plan 9 directories return Dir structures
@@ -1093,20 +1108,20 @@ func setupHooks(mu unicorn.Unicorn, kernel *sys.Kernel, hdr *aout.Header, TextAd
 				for offset < n {
 					// Check if we have enough data for the size field
 					if offset+2 > n {
-						fmt.Printf("[DIR] Not enough data for size field at offset %d\n", offset)
+						debugPrintf("[DIR] Not enough data for size field at offset %d\n", offset)
 						break
 					}
 
 					// Read size (first 2 bytes)
 					size := binary.LittleEndian.Uint16(buf[offset : offset+2])
 					if size < 2 || int(size) > n {
-						fmt.Printf("[DIR] Invalid size %d at offset %d\n", size, offset)
+						debugPrintf("[DIR] Invalid size %d at offset %d\n", size, offset)
 						break
 					}
 
 					// Check if we have enough data for the full Dir structure
 					if offset+int(size) > n {
-						fmt.Printf("[DIR] Dir structure %d bytes overflows buffer at offset %d\n", size, offset)
+						debugPrintf("[DIR] Dir structure %d bytes overflows buffer at offset %d\n", size, offset)
 						break
 					}
 
@@ -1114,13 +1129,13 @@ func setupHooks(mu unicorn.Unicorn, kernel *sys.Kernel, hdr *aout.Header, TextAd
 					dirData := buf[offset : offset+int(size)]
 					dir, err := sys.UnmarshalDir(dirData)
 					if err != nil {
-						fmt.Printf("[DIR] Error unmarshaling Dir: %v\n", err)
+						debugPrintf("[DIR] Error unmarshaling Dir: %v\n", err)
 						break
 					}
 
 					// Add to entries list
 					entries = append(entries, dir.Name)
-					fmt.Printf("[DIR] Found entry: %q (size=%d)\n", dir.Name, size)
+					debugPrintf("[DIR] Found entry: %q (size=%d)\n", dir.Name, size)
 
 					offset += int(size)
 					totalRead += uint64(size)
@@ -1137,7 +1152,7 @@ func setupHooks(mu unicorn.Unicorn, kernel *sys.Kernel, hdr *aout.Header, TextAd
 			}
 
 			// Write to stdout
-			fmt.Printf("[DIR] Writing %d entries to stdout\n", len(entries))
+			debugPrintf("[DIR] Writing %d entries to stdout\n", len(entries))
 			fmt.Printf("%s", output)
 
 			// Return number of entries
@@ -1154,39 +1169,39 @@ func setupHooks(mu unicorn.Unicorn, kernel *sys.Kernel, hdr *aout.Header, TextAd
 		// Check what syscall 51 (PWRITE) is doing
 		if addr == 0x208c5c && instructionCount > 100 {
 			// This is the syscall instruction in the new code path
-			fmt.Printf("[DEBUG] Syscall 51 (PWRITE) being executed\n")
+			debugPrintf("[DEBUG] Syscall 51 (PWRITE) being executed\n")
 			rax, _ := mu.RegRead(unicorn.X86_REG_RAX)
 			rdi, _ := mu.RegRead(unicorn.X86_REG_RDI)
 			rsi, _ := mu.RegRead(unicorn.X86_REG_RSI)
 			rdx, _ := mu.RegRead(unicorn.X86_REG_RDX)
-			fmt.Printf("[DEBUG] PWRITE: RAX=%d (fd), RDI=0x%x (count), RSI=0x%x (buf), RDX=0x%x (offset)\n", rax, rdi, rsi, rdx)
+			debugPrintf("[DEBUG] PWRITE: RAX=%d (fd), RDI=0x%x (count), RSI=0x%x (buf), RDX=0x%x (offset)\n", rax, rdi, rsi, rdx)
 
 			// Read the buffer being written
 			if rsi != 0 && rdi > 0 && rdi < 4096 {
 				data, _ := mu.MemRead(rsi, rdi)
-				fmt.Printf("[DEBUG] PWRITE data (%d bytes): %q\n", rdi, string(data))
+				debugPrintf("[DEBUG] PWRITE data (%d bytes): %q\n", rdi, string(data))
 			}
 		}
 
 		// Check function at 0x20b2de which processes directory entries
 		if addr == 0x20b2de {
-			fmt.Printf("[DEBUG] Entering directory processing function at 0x20b2de\n")
+			debugPrintf("[DEBUG] Entering directory processing function at 0x20b2de\n")
 		}
 		if addr == 0x20b2f2 {
 			// Comparison that decides whether to skip main logic
 			rdi, _ := mu.RegRead(unicorn.X86_REG_RDI)
-			fmt.Printf("[DEBUG] At 0x20b2f2: cmp edi, 0 - edi=%d (will jump if equal)\n", rdi)
+			debugPrintf("[DEBUG] At 0x20b2f2: cmp edi, 0 - edi=%d (will jump if equal)\n", rdi)
 		}
 	if addr == 0x20b2f5 {
 		// Conditional jump - if taken, skips main processing
-		fmt.Printf("[DEBUG] At 0x20b2f5: je 0x20b323 - would take early exit\n")
+		debugPrintf("[DEBUG] At 0x20b2f5: je 0x20b323 - would take early exit\n")
 
 		// Check if we've already called the directory read function
 		// by checking if the instruction is still a je (0x74)
 		bytes, _ := mu.MemRead(addr, 1)
 		if bytes[0] == 0x74 {
 			// This is still a je instruction, call the directory read function once
-			fmt.Printf("[DEBUG] Calling the directory read function (0x20b2fe) once\n")
+			debugPrintf("[DEBUG] Calling the directory read function (0x20b2fe) once\n")
 
 			// Set up a call to the function
 			retAddr := addr + 2
@@ -1205,35 +1220,35 @@ func setupHooks(mu unicorn.Unicorn, kernel *sys.Kernel, hdr *aout.Header, TextAd
 			return
 		} else {
 			// Already converted to nop, just continue
-			fmt.Printf("[DEBUG] Already called directory read function, continuing\n")
+			debugPrintf("[DEBUG] Already called directory read function, continuing\n")
 			continueAddr := addr + 1
 			mu.RegWrite(unicorn.X86_REG_RIP, continueAddr)
 			return
 		}
 	}
 		if addr == 0x20c0f1 {
-			fmt.Printf("[DEBUG] Function 0x20c0b6 about to return with xor eax,eax (eax=0)\n")
+			debugPrintf("[DEBUG] Function 0x20c0b6 about to return with xor eax,eax (eax=0)\n")
 		}
 		if addr == 0x20c0f3 {
-			fmt.Printf("[DEBUG] Reached ret instruction at 0x20c0f3\n")
+			debugPrintf("[DEBUG] Reached ret instruction at 0x20c0f3\n")
 			// FIX: Properly initialize the data structure
 			// The function builds a structure at RBP, but we need to copy it to [RSP+0x1a0]
 			// and set the function pointer field to make it valid
 			rbp, _ := mu.RegRead(unicorn.X86_REG_RBP)
 			rsp, _ := mu.RegRead(unicorn.X86_REG_RSP)
 
-			fmt.Printf("[FIX] Copying structure from RBP=0x%x to [RSP+0x1a0]\n", rbp)
-			fmt.Printf("[FIX] Target address: 0x%x\n", rsp+0x1a0)
+			debugPrintf("[FIX] Copying structure from RBP=0x%x to [RSP+0x1a0]\n", rbp)
+			debugPrintf("[FIX] Target address: 0x%x\n", rsp+0x1a0)
 
 			// Read the structure from RBP (40 bytes: 0x00, 0x08, 0x10, 0x18, 0x20, 0x28, 0x30)
 			structBytes, err := mu.MemRead(rbp, 40)
 			if err != nil {
-				fmt.Printf("[FIX] Error reading structure from RBP: %v\n", err)
+				debugPrintf("[FIX] Error reading structure from RBP: %v\n", err)
 				// Create a default structure
 				structBytes = make([]byte, 40)
 			} else {
-				fmt.Printf("[FIX] Read %d bytes from RBP\n", len(structBytes))
-				fmt.Printf("[FIX] Structure bytes: % x\n", structBytes)
+				debugPrintf("[FIX] Read %d bytes from RBP\n", len(structBytes))
+				debugPrintf("[FIX] Structure bytes: % x\n", structBytes)
 			}
 
 			// The structure should have:
@@ -1252,9 +1267,9 @@ func setupHooks(mu unicorn.Unicorn, kernel *sys.Kernel, hdr *aout.Header, TextAd
 			targetAddr := rsp + 0x1a0
 			err = mu.MemWrite(targetAddr, structBytes)
 			if err != nil {
-				fmt.Printf("[FIX] Error writing structure to target: %v\n", err)
+				debugPrintf("[FIX] Error writing structure to target: %v\n", err)
 			} else {
-				fmt.Printf("[FIX] Structure copied to 0x%x, function pointer set to 0x20b2fe\n", targetAddr)
+				debugPrintf("[FIX] Structure copied to 0x%x, function pointer set to 0x20b2fe\n", targetAddr)
 			}
 
 			// Return success
@@ -1262,16 +1277,16 @@ func setupHooks(mu unicorn.Unicorn, kernel *sys.Kernel, hdr *aout.Header, TextAd
 		}
 		if addr == 0x20d070 {
 			// FIX: This function also needs to return non-zero so main logic is NOT skipped
-			fmt.Printf("[FIX] Forcing return value from 0x20d070 to 1\n")
+			debugPrintf("[FIX] Forcing return value from 0x20d070 to 1\n")
 			mu.RegWrite(unicorn.X86_REG_RAX, uint64(1))
 		}
 
 		// Detect sysfatal entry/exit
 		if addr == 0x204191 && !inSysfatal {
 			inSysfatal = true
-			fmt.Printf("[DEBUG] Entered sysfatal at 0x%x\n", addr)
+			debugPrintf("[DEBUG] Entered sysfatal at 0x%x\n", addr)
 			rdi, _ := mu.RegRead(unicorn.X86_REG_RDI)
-			fmt.Printf("[DEBUG] sysfatal RDI (msg ptr) = 0x%x\n", rdi)
+			debugPrintf("[DEBUG] sysfatal RDI (msg ptr) = 0x%x\n", rdi)
 
 			if rdi != 0 && rdi >= DataAddr && rdi < DataAddr+0x10000 {
 				msgBytes, err := mu.MemRead(rdi, 256)
@@ -1285,13 +1300,13 @@ func setupHooks(mu unicorn.Unicorn, kernel *sys.Kernel, hdr *aout.Header, TextAd
 					}
 					if msgLen > 0 && msgLen < 256 {
 						errorMsg := string(msgBytes[:msgLen])
-						fmt.Printf("[DEBUG] sysfatal error message: %q\n", errorMsg)
+						debugPrintf("[DEBUG] sysfatal error message: %q\n", errorMsg)
 					}
 				}
 			}
 
 			// STUB: Don't call sysfatal function, just return
-			fmt.Printf("[STUB] Stubbing sysfatal - returning\n")
+			debugPrintf("[STUB] Stubbing sysfatal - returning\n")
 			retAddr := addr + 7 // Skip the call instruction
 			mu.RegWrite(unicorn.X86_REG_RIP, retAddr)
 			return
@@ -1299,20 +1314,20 @@ func setupHooks(mu unicorn.Unicorn, kernel *sys.Kernel, hdr *aout.Header, TextAd
 
 		if addr == 0x2041b8 {
 			inSysfatal = false
-			fmt.Printf("[DEBUG] Exiting sysfatal at 0x%x\n", addr)
+			debugPrintf("[DEBUG] Exiting sysfatal at 0x%x\n", addr)
 		}
 
 		// Check for indirect CALLs through registers (CALL *reg)
 		if addr == 0x20b5b8 {
 			// This is a call through RDI, which is currently 0x0 (NULL)
 			rdi, _ := mu.RegRead(unicorn.X86_REG_RDI)
-			fmt.Printf("[DEBUG] At 0x20b5b8: call rdi - RDI=0x%x (NULL pointer)\n", rdi)
+			debugPrintf("[DEBUG] At 0x20b5b8: call rdi - RDI=0x%x (NULL pointer)\n", rdi)
 
 			if rdi == 0 {
 				// This function pointer wasn't initialized
 				// Based on context, this might be a cleanup or next-function pointer
 				// Let's return success to skip this operation
-				fmt.Printf("[FIX] NULL function pointer at 0x20b5b8 - returning success\n")
+				debugPrintf("[FIX] NULL function pointer at 0x20b5b8 - returning success\n")
 
 				// Set up return to skip this call
 				rsp, _ := mu.RegRead(unicorn.X86_REG_RSP)
@@ -1374,20 +1389,20 @@ func setupHooks(mu unicorn.Unicorn, kernel *sys.Kernel, hdr *aout.Header, TextAd
 						// Get the last opened file from kernel
 						file, path := kernel.GetLastOpenFile()
 						if file == nil {
-							fmt.Printf("[READ] No file opened yet\n")
+							debugPrintf("[READ] No file opened yet\n")
 							retAddr := addr + 2
 							mu.RegWrite(unicorn.X86_REG_RIP, retAddr)
 							mu.RegWrite(unicorn.X86_REG_RAX, 0)
 							return
 						}
 
-						fmt.Printf("[READ] Reading from %q\n", path)
+						debugPrintf("[READ] Reading from %q\n", path)
 
 						// Read from the file
 						buf := make([]byte, count)
 						n, err := file.Read(buf)
 						if err != nil && err != io.EOF {
-							fmt.Printf("[READ] Error: %v\n", err)
+							debugPrintf("[READ] Error: %v\n", err)
 							retAddr := addr + 2
 							mu.RegWrite(unicorn.X86_REG_RIP, retAddr)
 							mu.RegWrite(unicorn.X86_REG_RAX, 0)
@@ -1397,7 +1412,7 @@ func setupHooks(mu unicorn.Unicorn, kernel *sys.Kernel, hdr *aout.Header, TextAd
 						// Write to emulated memory
 						mu.MemWrite(bufAddr, buf[:n])
 
-						fmt.Printf("[READ] Read %d bytes from %s\n", n, path)
+						debugPrintf("[READ] Read %d bytes from %s\n", n, path)
 						if n > 0 {
 							fmt.Printf("*** OUTPUT: %s", string(buf[:n]))
 						}
@@ -1412,7 +1427,7 @@ func setupHooks(mu unicorn.Unicorn, kernel *sys.Kernel, hdr *aout.Header, TextAd
 					// Check if target is valid (in text segment and not all zeros)
 					if target < TextAddr || target >= TextAddr+uint64(hdr.Text) || target == 0 {
 						fmt.Printf("\n[INDIRECT CALL] at 0x%x: CALL %s (0x%x)\n", addr, regName, target)
-						fmt.Printf("[INDIRECT CALL] Target invalid - returning success to make setup succeed\n")
+						debugPrintf("[INDIRECT CALL] Target invalid - returning success to make setup succeed\n")
 						// Instead of skipping, return success (RAX=0)
 						// This makes setup functions succeed instead of calling exits()
 						retAddr := addr + 2
@@ -1435,7 +1450,7 @@ func setupHooks(mu unicorn.Unicorn, kernel *sys.Kernel, hdr *aout.Header, TextAd
 				// This is called by pwd and other utilities to update display
 				// Since we don't have graphics, just return success
 				if target == 0x200086 {
-					fmt.Printf("[STUB] Call to display update function at 0x%x - stubbing\n", target)
+					debugPrintf("[STUB] Call to display update function at 0x%x - stubbing\n", target)
 					// Skip the call and return success
 					retAddr := addr + 5
 					mu.RegWrite(unicorn.X86_REG_RIP, retAddr)
@@ -1451,7 +1466,7 @@ func setupHooks(mu unicorn.Unicorn, kernel *sys.Kernel, hdr *aout.Header, TextAd
 				// Skip it only when called from 0x2000bf (before files are opened)
 				// But allow it when called from 0x200130 (after files are opened, for reading)
 				if target == 0x200008 && addr == 0x2000bf {
-					fmt.Printf("[STUB] Skipping init function call from 0x%x (before OPEN)\n", addr)
+					debugPrintf("[STUB] Skipping init function call from 0x%x (before OPEN)\n", addr)
 					retAddr := addr + 5
 					mu.RegWrite(unicorn.X86_REG_RIP, retAddr)
 					mu.RegWrite(unicorn.X86_REG_RAX, 0) // Return success
@@ -1461,7 +1476,7 @@ func setupHooks(mu unicorn.Unicorn, kernel *sys.Kernel, hdr *aout.Header, TextAd
 				// SPECIAL CASE: Stub the exits call from setup function
 				// Setup calls exits when initialization fails, but we want to continue
 				if addr == 0x20407f && target == 0x2040a4 {
-					fmt.Printf("[STUB] Setup function calling exits - stubbing to return success\n")
+					debugPrintf("[STUB] Setup function calling exits - stubbing to return success\n")
 					retAddr := addr + 5
 					mu.RegWrite(unicorn.X86_REG_RIP, retAddr)
 					mu.RegWrite(unicorn.X86_REG_RAX, 0) // Return success from setup
@@ -1486,7 +1501,7 @@ func setupHooks(mu unicorn.Unicorn, kernel *sys.Kernel, hdr *aout.Header, TextAd
 
 					// Special handling for sysfatal
 					if addr == 0x2041b3 {
-						fmt.Printf("[STUB] sysfatal trying to call function at 0x%x - returning\n", target)
+						debugPrintf("[STUB] sysfatal trying to call function at 0x%x - returning\n", target)
 						mu.RegWrite(unicorn.X86_REG_RIP, retAddr)
 						return
 					}
@@ -1501,13 +1516,13 @@ func setupHooks(mu unicorn.Unicorn, kernel *sys.Kernel, hdr *aout.Header, TextAd
 					// Generic stub implementation
 					fmt.Printf("\n[STUB] Intercepted CALL from 0x%x to 0x%x\n", addr, target)
 					if targetOutsideCode {
-						fmt.Printf("[STUB] Target is outside code segment\n")
+						debugPrintf("[STUB] Target is outside code segment\n")
 					} else if allZeros {
-						fmt.Printf("[STUB] Target contains NULL bytes (unlinked)\n")
+						debugPrintf("[STUB] Target contains NULL bytes (unlinked)\n")
 					}
 					mu.RegWrite(unicorn.X86_REG_RAX, 0)
 					mu.RegWrite(unicorn.X86_REG_RIP, retAddr)
-					fmt.Printf("[STUB] Continuing to 0x%x\n", retAddr)
+					debugPrintf("[STUB] Continuing to 0x%x\n", retAddr)
 					return
 				}
 			} else if len(bytes) >= 2 && bytes[0] == 0xFF && bytes[1] == 0xD1 {
@@ -1519,7 +1534,7 @@ func setupHooks(mu unicorn.Unicorn, kernel *sys.Kernel, hdr *aout.Header, TextAd
 				// This is called by pwd and other utilities to update display
 				// Since we don't have graphics, just return success
 				if target == 0x200086 {
-					fmt.Printf("[STUB] Indirect call to display update function at 0x%x (via RDI) - stubbing\n", target)
+					debugPrintf("[STUB] Indirect call to display update function at 0x%x (via RDI) - stubbing\n", target)
 					// Skip the call and return success
 					retAddr := addr + 2 // FF d1 is 2 bytes
 					mu.RegWrite(unicorn.X86_REG_RIP, retAddr)
@@ -1531,7 +1546,7 @@ func setupHooks(mu unicorn.Unicorn, kernel *sys.Kernel, hdr *aout.Header, TextAd
 				// pwd calls an invalid function pointer (0x41fff28) which causes crashes
 				// Just stub this specific call site to return success
 				if addr == 0x2000ac {
-					fmt.Printf("[STUB] pwd display call at 0x%x to invalid target 0x%x - stubbing\n", addr, target)
+					debugPrintf("[STUB] pwd display call at 0x%x to invalid target 0x%x - stubbing\n", addr, target)
 					retAddr := addr + 2 // FF d1 is 2 bytes
 					mu.RegWrite(unicorn.X86_REG_RIP, retAddr)
 					mu.RegWrite(unicorn.X86_REG_RAX, 0) // Return success
@@ -1559,7 +1574,7 @@ func setupHooks(mu unicorn.Unicorn, kernel *sys.Kernel, hdr *aout.Header, TextAd
 
 					// Special handling for sysfatal
 					if addr == 0x2041b3 {
-						fmt.Printf("[STUB] sysfatal trying to call function at 0x%x - returning\n", target)
+						debugPrintf("[STUB] sysfatal trying to call function at 0x%x - returning\n", target)
 						mu.RegWrite(unicorn.X86_REG_RIP, retAddr)
 						return
 					}
@@ -1574,13 +1589,13 @@ func setupHooks(mu unicorn.Unicorn, kernel *sys.Kernel, hdr *aout.Header, TextAd
 					// Generic stub implementation
 					fmt.Printf("\n[STUB] Intercepted indirect CALL from 0x%x to 0x%x (via RDI)\n", addr, target)
 					if targetOutsideCode {
-						fmt.Printf("[STUB] Target is outside code segment\n")
+						debugPrintf("[STUB] Target is outside code segment\n")
 					} else if allZeros {
-						fmt.Printf("[STUB] Target contains NULL bytes (unlinked)\n")
+						debugPrintf("[STUB] Target contains NULL bytes (unlinked)\n")
 					}
 					mu.RegWrite(unicorn.X86_REG_RAX, 0)
 					mu.RegWrite(unicorn.X86_REG_RIP, retAddr)
-					fmt.Printf("[STUB] Continuing to 0x%x\n", retAddr)
+					debugPrintf("[STUB] Continuing to 0x%x\n", retAddr)
 					return
 				}
 			}
@@ -1670,12 +1685,12 @@ func setupHooks(mu unicorn.Unicorn, kernel *sys.Kernel, hdr *aout.Header, TextAd
 		if addr == 0x204086 {
 			rbp, _ := mu.RegRead(unicorn.X86_REG_RBP)
 			rsp, _ := mu.RegRead(unicorn.X86_REG_RSP)
-			fmt.Printf("[DEBUG] At 0x204086: RBP=0x%x (will be moved to [RSP+8]=0x%x)\n", rbp, rsp+8)
+			debugPrintf("[DEBUG] At 0x204086: RBP=0x%x (will be moved to [RSP+8]=0x%x)\n", rbp, rsp+8)
 			// Try to read what's at RBP if it looks like a pointer
 			if rbp > 0x1000 && rbp < 0x1000000 {
 				testBytes, err := mu.MemRead(rbp, 16)
 				if err == nil {
-					fmt.Printf("[DEBUG] Data at RBP: % x\n", testBytes)
+					debugPrintf("[DEBUG] Data at RBP: % x\n", testBytes)
 				}
 			}
 		}
@@ -1685,12 +1700,12 @@ func setupHooks(mu unicorn.Unicorn, kernel *sys.Kernel, hdr *aout.Header, TextAd
 			r9, _ := mu.RegRead(unicorn.X86_REG_R9)
 			rbp, _ := mu.RegRead(unicorn.X86_REG_RBP)
 			r9d := r9 & 0xFFFFFFFF // Low 32 bits
-			fmt.Printf("[DEBUG] At 0x2000df: BEFORE movsxd, R9=0x%x (R9D=0x%x), RBP=%d\n", r9, r9d, rbp)
+			debugPrintf("[DEBUG] At 0x2000df: BEFORE movsxd, R9=0x%x (R9D=0x%x), RBP=%d\n", r9, r9d, rbp)
 			// Manually execute the movsxd since it might not be working correctly
 			// Sign-extend R9D to 64 bits and store in RBP
 			signExtended := uint64(int64(int32(r9d)))
 			mu.RegWrite(unicorn.X86_REG_RBP, signExtended)
-			fmt.Printf("[DEBUG] Manually executed movsxd: RBP = %d (sign-extended from R9D=%d)\n", signExtended, r9d)
+			debugPrintf("[DEBUG] Manually executed movsxd: RBP = %d (sign-extended from R9D=%d)\n", signExtended, r9d)
 			// Skip the actual instruction (3 bytes: 48 63 e9)
 			mu.RegWrite(unicorn.X86_REG_RIP, addr+3)
 			return
@@ -1699,57 +1714,57 @@ func setupHooks(mu unicorn.Unicorn, kernel *sys.Kernel, hdr *aout.Header, TextAd
 		if addr == 0x200135 {
 			// After init function returns
 			rsp, _ := mu.RegRead(unicorn.X86_REG_RSP)
-			fmt.Printf("[DEBUG] Init function returned to 0x%x, RSP=0x%x\n", addr, rsp)
+			debugPrintf("[DEBUG] Init function returned to 0x%x, RSP=0x%x\n", addr, rsp)
 		}
 
 		if addr == 0x20013e {
 			// After call to init function
 			rbx, _ := mu.RegRead(unicorn.X86_REG_RBX)
-			fmt.Printf("[DEBUG] At 0x20013e: RBX=%d (file counter?)\n", rbx)
+			debugPrintf("[DEBUG] At 0x20013e: RBX=%d (file counter?)\n", rbx)
 		}
 
 		if addr == 0x200146 {
 			// Increment/instruction
 			rcx, _ := mu.RegRead(unicorn.X86_REG_RCX)
-			fmt.Printf("[DEBUG] At 0x200146: RCX=%d (before increment)\n", rcx)
+			debugPrintf("[DEBUG] At 0x200146: RCX=%d (before increment)\n", rcx)
 		}
 
 		if addr == 0x200148 {
 			// Jump back
-			fmt.Printf("[DEBUG] At 0x200148: Jumping back (jmp -115 to 0x2000bb)\n")
+			debugPrintf("[DEBUG] At 0x200148: Jumping back (jmp -115 to 0x2000bb)\n")
 		}
 
 		if addr == 0x200135 {
 			// After init function should return here
 			rsp, _ := mu.RegRead(unicorn.X86_REG_RSP)
-			fmt.Printf("[DEBUG] SHOULD BE: Init function returned to 0x%x, RSP=0x%x\n", addr, rsp)
+			debugPrintf("[DEBUG] SHOULD BE: Init function returned to 0x%x, RSP=0x%x\n", addr, rsp)
 		}
 
 		if addr == 0x20013e {
 			// Should come here after init returns
 			rbx, _ := mu.RegRead(unicorn.X86_REG_RBX)
-			fmt.Printf("[DEBUG] At 0x20013e: RBX=%d (bytes read?)\n", rbx)
+			debugPrintf("[DEBUG] At 0x20013e: RBX=%d (bytes read?)\n", rbx)
 		}
 
 		if addr == 0x200142 {
 			rbx, _ := mu.RegRead(unicorn.X86_REG_RBX)
-			fmt.Printf("[DEBUG] At 0x200142: RBX=%d (after call)\n", rbx)
+			debugPrintf("[DEBUG] At 0x200142: RBX=%d (after call)\n", rbx)
 		}
 
 		if addr == 0x200146 {
 			// Increment RCX
 			rcx, _ := mu.RegRead(unicorn.X86_REG_RCX)
-			fmt.Printf("[DEBUG] At 0x200146: Before increment, RCX=%d\n", rcx)
+			debugPrintf("[DEBUG] At 0x200146: Before increment, RCX=%d\n", rcx)
 		}
 
 		if addr == 0x200148 {
-			fmt.Printf("[DEBUG] At 0x200148: Jump instruction - should loop back\n")
+			debugPrintf("[DEBUG] At 0x200148: Jump instruction - should loop back\n")
 		}
 
 		if addr == 0x2000bb {
 			// Main entry point - log when we come back
 			r15, _ := mu.RegRead(unicorn.X86_REG_R15)
-			fmt.Printf("[DEBUG] Back to main at 0x2000bb: R15=%d (file index?)\n", r15)
+			debugPrintf("[DEBUG] Back to main at 0x2000bb: R15=%d (file index?)\n", r15)
 		}
 
 		if addr == 0x2000e2 {
@@ -1760,8 +1775,8 @@ func setupHooks(mu unicorn.Unicorn, kernel *sys.Kernel, hdr *aout.Header, TextAd
 			dataBytes, err := mu.MemRead(target, 8)
 			if err == nil {
 				data := binary.LittleEndian.Uint64(dataBytes)
-				fmt.Printf("[DEBUG] At 0x2000e2: RBP=%d (after movsxd), will load RDI from [RSP+0x38] = [0x%x]\n", rbp, target)
-				fmt.Printf("[DEBUG] Data at [0x%x]: 0x%x (this will be RDI)\n", target, data)
+				debugPrintf("[DEBUG] At 0x2000e2: RBP=%d (after movsxd), will load RDI from [RSP+0x38] = [0x%x]\n", rbp, target)
+				debugPrintf("[DEBUG] Data at [0x%x]: 0x%x (this will be RDI)\n", target, data)
 			}
 		}
 
@@ -1770,15 +1785,15 @@ func setupHooks(mu unicorn.Unicorn, kernel *sys.Kernel, hdr *aout.Header, TextAd
 			rdi, _ := mu.RegRead(unicorn.X86_REG_RDI)
 			rbp, _ := mu.RegRead(unicorn.X86_REG_RBP)
 			rsp, _ := mu.RegRead(unicorn.X86_REG_RSP)
-			fmt.Printf("[DEBUG] At 0x2000e7: RDI=0x%x, RBP=%d, RSP=0x%x\n", rdi, rbp, rsp)
+			debugPrintf("[DEBUG] At 0x2000e7: RDI=0x%x, RBP=%d, RSP=0x%x\n", rdi, rbp, rsp)
 			// Calculate target address
 			targetAddr := rdi + uint64(rbp)*8
-			fmt.Printf("[DEBUG] Will load RBP from [RDI+RBP*8] = [0x%x]\n", targetAddr)
+			debugPrintf("[DEBUG] Will load RBP from [RDI+RBP*8] = [0x%x]\n", targetAddr)
 			// Read what's at that address
 			dataBytes, err := mu.MemRead(targetAddr, 8)
 			if err == nil {
 				data := binary.LittleEndian.Uint64(dataBytes)
-				fmt.Printf("[DEBUG] Data at [0x%x]: 0x%x (% x)\n", targetAddr, data, dataBytes)
+				debugPrintf("[DEBUG] Data at [0x%x]: 0x%x (% x)\n", targetAddr, data, dataBytes)
 			}
 		}
 	}, 1, 0)
@@ -1790,7 +1805,7 @@ func setupHooks(mu unicorn.Unicorn, kernel *sys.Kernel, hdr *aout.Header, TextAd
 		rdi, _ := mu.RegRead(unicorn.X86_REG_RDI)
 		rsi, _ := mu.RegRead(unicorn.X86_REG_RSI)
 		rdx, _ := mu.RegRead(unicorn.X86_REG_RDX)
-		fmt.Printf("[SYSCALL] Syscall %d (RAX=%x, RDI=%x, RSI=%x, RDX=%x)\n", rbp, rax, rdi, rsi, rdx)
+		debugPrintf("[SYSCALL] Syscall %d (RAX=%x, RDI=%x, RSI=%x, RDX=%x)\n", rbp, rax, rdi, rsi, rdx)
 
 		// Call the syscall handler FIRST
 		sys.Handle(mu, kernel)
@@ -1798,7 +1813,7 @@ func setupHooks(mu unicorn.Unicorn, kernel *sys.Kernel, hdr *aout.Header, TextAd
 		// Check if the syscall set RIP to 0 (exits with error like pwd's "main" not found)
 		rip, _ := mu.RegRead(unicorn.X86_REG_RIP)
 		if rip == 0 {
-			fmt.Printf("[SYSCALL] Exits set RIP to 0, stopping emulation cleanly\n")
+			debugPrintf("[SYSCALL] Exits set RIP to 0, stopping emulation cleanly\n")
 			mu.Stop()
 			return
 		}
@@ -1806,12 +1821,12 @@ func setupHooks(mu unicorn.Unicorn, kernel *sys.Kernel, hdr *aout.Header, TextAd
 		// AFTER the syscall, read the return value
 		if rbp == 14 { // OPEN syscall
 			retVal, _ := mu.RegRead(unicorn.X86_REG_RAX)
-			fmt.Printf("[SYSCALL] Return value (RAX): %d\n", retVal)
+			debugPrintf("[SYSCALL] Return value (RAX): %d\n", retVal)
 			// Also log what's at [rsp+8] (path pointer)
 			rsp, _ := mu.RegRead(unicorn.X86_REG_RSP)
 			pathPtrBytes, _ := mu.MemRead(rsp+8, 8)
 			pathPtr := binary.LittleEndian.Uint64(pathPtrBytes)
-			fmt.Printf("[SYSCALL] Path pointer at [RSP+8]: 0x%x\n", pathPtr)
+			debugPrintf("[SYSCALL] Path pointer at [RSP+8]: 0x%x\n", pathPtr)
 		}
 	}, 1, 0, unicorn.X86_INS_SYSCALL)
 

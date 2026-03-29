@@ -147,6 +147,8 @@ type Kernel struct {
 	nprivatesAddr uint64 // Memory address of _nprivates
 	endAddr       uint64 // Memory address of end symbol
 	onexitAddr    uint64 // Memory address of _onexit
+	onexitHandlers []uint64 // Registered cleanup function addresses
+	Quiet         bool   // Suppress debug output
 	// Track opened files by path for read operations
 	openFiles     map[string]*os.File
 	lastOpenPath  string
@@ -340,7 +342,7 @@ func Handle(mu unicorn.Unicorn, k *Kernel) {
 	if tracer != nil && tracer.enabled {
 		tracer.LogCall(rbp)
 	} else {
-		fmt.Printf("[sys] syscall %d (RBP=%d)\n", rbp, rbp)
+		k.debugPrintf("[sys] syscall %d (RBP=%d)\n", rbp, rbp)
 	}
 
 	switch rbp {
@@ -433,7 +435,7 @@ func Handle(mu unicorn.Unicorn, k *Kernel) {
 	case EXEC:
 		k.handleExec(mu, rsp)
 	default:
-		fmt.Printf("[sys] unimplemented syscall %d\n", rbp)
+		k.debugPrintf("[sys] unimplemented syscall %d\n", rbp)
 		k.setError(mu, "syscall not implemented")
 	}
 }
@@ -449,7 +451,7 @@ func (k *Kernel) handleExits(mu unicorn.Unicorn, rsp uint64) {
 		if err == nil {
 			status = s
 		}
-		fmt.Printf("[sys] exits with message: %q\n", status)
+		k.debugPrintf("[sys] exits with message: %q\n", status)
 
 		// Special case for pwd: it exits with a "main" error
 		// Check if the message contains "main" or starts with "R{"
@@ -461,7 +463,7 @@ func (k *Kernel) handleExits(mu unicorn.Unicorn, rsp uint64) {
 			return
 		}
 	} else {
-		fmt.Printf("[sys] exits cleanly (no message)\n")
+		k.debugPrintf("[sys] exits cleanly (no message)\n")
 	}
 
 	// Don't stop emulation - return success instead
@@ -503,7 +505,7 @@ func (k *Kernel) handleRead(mu unicorn.Unicorn, rsp uint64) {
 	buf, _ := readArg(mu, rsp, 1)
 	n, _ := readArg(mu, rsp, 2)
 
-	fmt.Printf("[sys] READ: fd=%d buf=0x%x n=%d\n", int(fd), buf, n)
+	k.debugPrintf("[sys] READ: fd=%d buf=0x%x n=%d\n", int(fd), buf, n)
 
 	// Look up the file descriptor
 	file, ok := k.lookupFd(int(fd))
@@ -516,7 +518,7 @@ func (k *Kernel) handleRead(mu unicorn.Unicorn, rsp uint64) {
 	// Check if this is a directory
 	info, err := file.Stat()
 	if err == nil && info.IsDir() {
-		fmt.Printf("[sys] READ: Reading from directory %s\n", file.Name())
+		k.debugPrintf("[sys] READ: Reading from directory %s\n", file.Name())
 
 		// Check if we have cached entries for this directory
 		entries, hasCached := k.dirEntries[int(fd)]
@@ -524,23 +526,23 @@ func (k *Kernel) handleRead(mu unicorn.Unicorn, rsp uint64) {
 			// First read - cache the directory entries
 			entries, err = os.ReadDir(file.Name())
 			if err != nil {
-				fmt.Printf("[sys] READ: Error reading directory: %v\n", err)
+				k.debugPrintf("[sys] READ: Error reading directory: %v\n", err)
 				k.setError(mu, err.Error())
 				setReturn(mu, ^uint64(0))
 				return
 			}
 			k.dirEntries[int(fd)] = entries
 			k.dirOffsets[int(fd)] = 0
-			fmt.Printf("[sys] READ: Cached %d directory entries for fd=%d\n", len(entries), int(fd))
+			k.debugPrintf("[sys] READ: Cached %d directory entries for fd=%d\n", len(entries), int(fd))
 		}
 
 		// Get current offset
 		offset := k.dirOffsets[int(fd)]
-		fmt.Printf("[sys] READ: Directory read at offset %d/%d\n", offset, len(entries))
+		k.debugPrintf("[sys] READ: Directory read at offset %d/%d\n", offset, len(entries))
 
 		// Check if we've reached the end
 		if offset >= len(entries) {
-			fmt.Printf("[sys] READ: End of directory\n")
+			k.debugPrintf("[sys] READ: End of directory\n")
 			setReturn(mu, 0) // EOF
 			return
 		}
@@ -558,7 +560,7 @@ func (k *Kernel) handleRead(mu unicorn.Unicorn, rsp uint64) {
 				// Don't include this entry - it would overflow the buffer
 				if uint64(len(dirData)) > 0 {
 					// Log overflow only if we have some data
-					fmt.Printf("[sys] READ: Dir structure %d bytes would overflow buffer (have %d, need %d)\n",
+					k.debugPrintf("[sys] READ: Dir structure %d bytes would overflow buffer (have %d, need %d)\n",
 						len(data), len(dirData), len(dirData)+len(data))
 				}
 				break
@@ -591,7 +593,7 @@ func (k *Kernel) handleRead(mu unicorn.Unicorn, rsp uint64) {
 		k.dirOffsets[int(fd)] = offset + entriesWritten
 
 		mu.MemWrite(buf, dirData[:bytesWritten])
-		fmt.Printf("[sys] READ: Directory read returned %d bytes (%d entries), new offset=%d\n", bytesWritten, entriesWritten, k.dirOffsets[int(fd)])
+		k.debugPrintf("[sys] READ: Directory read returned %d bytes (%d entries), new offset=%d\n", bytesWritten, entriesWritten, k.dirOffsets[int(fd)])
 		setReturn(mu, bytesWritten)
 		return
 	}
@@ -612,7 +614,7 @@ func (k *Kernel) handleOpen(mu unicorn.Unicorn, rsp uint64) {
 	pathPtr, _ := readArg(mu, rsp, 0)
 	mode, _ := readArg(mu, rsp, 1)
 
-	fmt.Printf("[sys] OPEN: pathPtr=0x%x mode=%d\n", pathPtr, mode)
+	k.debugPrintf("[sys] OPEN: pathPtr=0x%x mode=%d\n", pathPtr, mode)
 
 	// Special case: The binary has filenames encoded as 64-bit immediate values
 	// 0x7478742e74736574 in little-endian is "test.txt"
@@ -623,24 +625,24 @@ func (k *Kernel) handleOpen(mu unicorn.Unicorn, rsp uint64) {
 	if pathPtr == 0x7478742e74736574 {
 		// Hardcoded "test.txt" value in the binary
 		path = "test.txt"
-		fmt.Printf("[sys] OPEN: Detected hardcoded 'test.txt' value (0x%x)\n", pathPtr)
+		k.debugPrintf("[sys] OPEN: Detected hardcoded 'test.txt' value (0x%x)\n", pathPtr)
 	} else if pathPtr == 0x78742e31656c6966 {
 		// Hardcoded "file1.txt" value
 		path = "file1.txt"
-		fmt.Printf("[sys] OPEN: Detected hardcoded 'file1.txt' value (0x%x)\n", pathPtr)
+		k.debugPrintf("[sys] OPEN: Detected hardcoded 'file1.txt' value (0x%x)\n", pathPtr)
 	} else if pathPtr == 0x78742e32656c6966 {
 		// Hardcoded "file2.txt" value
 		path = "file2.txt"
-		fmt.Printf("[sys] OPEN: Detected hardcoded 'file2.txt' value (0x%x)\n", pathPtr)
+		k.debugPrintf("[sys] OPEN: Detected hardcoded 'file2.txt' value (0x%x)\n", pathPtr)
 	} else if pathPtr > 0x10000 && pathPtr < 0x100000000 {
 		// Try to read the path normally (looks like a valid pointer)
-		fmt.Printf("[sys] OPEN: Trying to read path from 0x%x\n", pathPtr)
+		k.debugPrintf("[sys] OPEN: Trying to read path from 0x%x\n", pathPtr)
 		path, err = readString(mu, pathPtr, 1024)
 		if err != nil {
-			fmt.Printf("[sys] OPEN: Failed to read path at 0x%x: %v\n", pathPtr, err)
+			k.debugPrintf("[sys] OPEN: Failed to read path at 0x%x: %v\n", pathPtr, err)
 			path = ""
 		} else {
-			fmt.Printf("[sys] OPEN: Successfully read path: %q\n", path)
+			k.debugPrintf("[sys] OPEN: Successfully read path: %q\n", path)
 		}
 	} else {
 		// Check if pathPtr contains inline string data (looks like ASCII text)
@@ -667,14 +669,14 @@ func (k *Kernel) handleOpen(mu unicorn.Unicorn, rsp uint64) {
 		}
 		if isFilename && end > 0 {
 			path = string(pathBytes[:end])
-			fmt.Printf("[sys] OPEN: Extracted inline filename %q from 0x%x\n", path, pathPtr)
+			k.debugPrintf("[sys] OPEN: Extracted inline filename %q from 0x%x\n", path, pathPtr)
 		} else {
 			path = ""
-			fmt.Printf("[sys] OPEN: Invalid path pointer 0x%x\n", pathPtr)
+			k.debugPrintf("[sys] OPEN: Invalid path pointer 0x%x\n", pathPtr)
 		}
 	}
 
-	fmt.Printf("[sys] OPEN: path=%q mode=%d\n", path, mode)
+	k.debugPrintf("[sys] OPEN: path=%q mode=%d\n", path, mode)
 
 	var flag int
 	switch mode & 3 {
@@ -693,19 +695,19 @@ func (k *Kernel) handleOpen(mu unicorn.Unicorn, rsp uint64) {
 
 	f, err := os.OpenFile(path, flag, 0666)
 	if err != nil {
-		fmt.Printf("[sys] OPEN failed: %v\n", err)
+		k.debugPrintf("[sys] OPEN failed: %v\n", err)
 		k.setError(mu, err.Error())
 		return
 	}
 
 	fd := k.allocFd(f)
-	fmt.Printf("[sys] OPEN succeeded: fd=%d\n", fd)
+	k.debugPrintf("[sys] OPEN succeeded: fd=%d\n", fd)
 
 	// Keep track of opened files by path so we can read from them later
 	// even if the fd is closed
 	k.openFiles[path] = f
 	k.lastOpenPath = path
-	fmt.Printf("[sys] Stored file reference for path=%q\n", path)
+	k.debugPrintf("[sys] Stored file reference for path=%q\n", path)
 
 	setReturn(mu, uint64(fd))
 }
@@ -777,19 +779,19 @@ func (k *Kernel) handlePWrite(mu unicorn.Unicorn, rsp uint64) {
 			}
 		}
 		if len(data) > 0 {
-			fmt.Printf("[sys] PWRITE count=-1, writing %d bytes: %q\n", len(data), string(data))
+			k.debugPrintf("[sys] PWRITE count=-1, writing %d bytes: %q\n", len(data), string(data))
 		} else {
-			fmt.Printf("[sys] PWRITE count=-1, but buffer is empty!\n")
+			k.debugPrintf("[sys] PWRITE count=-1, but buffer is empty!\n")
 			// Debug: show first 256 bytes of buffer
 			debugData, _ := mu.MemRead(buf, 256)
-			fmt.Printf("[sys] Buffer contents: % x\n", debugData)
+			k.debugPrintf("[sys] Buffer contents: % x\n", debugData)
 		}
 	} else {
 		data, err = mu.MemRead(buf, n)
 		if len(data) > 0 {
-			fmt.Printf("[sys] PWRITE count=%d, writing: %q\n", n, string(data))
+			k.debugPrintf("[sys] PWRITE count=%d, writing: %q\n", n, string(data))
 		} else {
-			fmt.Printf("[sys] PWRITE count=%d, but buffer is empty!\n", n)
+			k.debugPrintf("[sys] PWRITE count=%d, but buffer is empty!\n", n)
 		}
 	}
 
@@ -859,7 +861,7 @@ func (k *Kernel) handleErrstr(mu unicorn.Unicorn, rsp uint64) {
 
 func (k *Kernel) handleSleep(mu unicorn.Unicorn, rsp uint64) {
 	millis, _ := readArg(mu, rsp, 0)
-	fmt.Printf("[sys] SLEEP(%d)\n", millis)
+	k.debugPrintf("[sys] SLEEP(%d)\n", millis)
 	time.Sleep(time.Duration(millis) * time.Millisecond)
 	setReturn(mu, 0)
 }
@@ -868,7 +870,7 @@ func (k *Kernel) handleNsec(mu unicorn.Unicorn, rsp uint64) {
 	// Return nanoseconds since epoch in RAX
 	now := time.Now()
 	unixNano := now.UnixNano()
-	fmt.Printf("[sys] NSEC() -> %d\n", unixNano)
+	k.debugPrintf("[sys] NSEC() -> %d\n", unixNano)
 	setReturn(mu, uint64(unixNano))
 }
 
@@ -918,6 +920,19 @@ func (k *Kernel) SetOnexitAddress(addr uint64) {
 	k.onexitAddr = addr
 }
 
+
+// SetQuiet sets whether to suppress debug output
+func (k *Kernel) SetQuiet(quiet bool) {
+	k.Quiet = quiet
+}
+
+// debugPrintf prints debug output only if not in quiet mode
+func (k *Kernel) debugPrintf(format string, args ...interface{}) {
+	if !k.Quiet {
+		fmt.Printf(format, args...)
+	}
+}
+
 // InitTimeStructures initializes the Plan 9 time structure at the fixed memory location
 // This is required by programs like 'date' that read time from memory
 func (k *Kernel) InitTimeStructures(mu unicorn.Unicorn, dataAddr uint64) error {
@@ -955,7 +970,7 @@ func (k *Kernel) InitTimeStructures(mu unicorn.Unicorn, dataAddr uint64) error {
 	timeDataAddr := dataAddr + 0x5a50 // 0x405a50
 	err := k.WriteTmToMemory(mu, timeDataAddr, tm)
 	if err == nil {
-		fmt.Printf("[TIME] Initialized time structure at 0x%x: %04d-%02d-%02d %02d:%02d:%02d %s\n",
+		k.debugPrintf("[TIME] Initialized time structure at 0x%x: %04d-%02d-%02d %02d:%02d:%02d %s\n",
 			timeDataAddr, tm.Year, tm.Mon+1, tm.Mday, tm.Hour, tm.Min, tm.Sec, string(tm.Zone[:]))
 	}
 	return err
